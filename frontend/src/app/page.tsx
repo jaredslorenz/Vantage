@@ -1,25 +1,24 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { createClient } from "@/lib/supabase";
+import { createClient } from "@/lib/supabase/client";
+import { useRouter } from "next/navigation";
 import LoginButton from "@/components/LoginButton";
 import { createOrUpdateUser } from "./actions/user";
-import type { User } from "@supabase/supabase-js";
 
 export default function Home() {
-  const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const router = useRouter();
   const supabase = createClient();
 
   useEffect(() => {
-    // Check if user is logged in
     const checkUser = async () => {
       const {
         data: { user },
       } = await supabase.auth.getUser();
 
       if (user) {
-        // User is logged in - make sure they exist in our database
+        // User is logged in - create/update their record
         const result = await createOrUpdateUser();
 
         if (result.error) {
@@ -27,10 +26,13 @@ export default function Home() {
         } else {
           console.log("User record ready:", result.user);
         }
-      }
 
-      setUser(user);
-      setLoading(false);
+        // Redirect to dashboard
+        router.push("/dashboard");
+      } else {
+        // Not logged in - show landing page
+        setLoading(false);
+      }
     };
 
     checkUser();
@@ -39,71 +41,32 @@ export default function Home() {
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange(async (event, session) => {
-      setUser(session?.user ?? null);
-
       if (session?.user) {
-        // User just logged in - create/update their record
+        // User just logged in - create/update their record then redirect
         await createOrUpdateUser();
+        router.push("/dashboard");
       }
     });
 
     return () => subscription.unsubscribe();
-  }, []);
-
-  const handleLogout = async () => {
-    await supabase.auth.signOut();
-  };
+  }, [router]);
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <p className="text-gray-600">Loading...</p>
+      <div className="min-h-screen flex items-center justify-center bg-gradient-brand">
+        <p className="text-white/80">Loading...</p>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50">
+    <div className="min-h-screen flex items-center justify-center bg-gradient-brand">
       <div className="text-center">
-        <h1 className="text-4xl font-bold mb-8">Vantage</h1>
-
-        {user ? (
-          <div className="space-y-4">
-            <p className="text-lg text-gray-700">
-              Welcome,{" "}
-              <span className="font-semibold">
-                {user.user_metadata.user_name}
-              </span>
-              !
-            </p>
-            <div className="flex items-center justify-center gap-4">
-              {user.user_metadata.avatar_url && (
-                <img
-                  src={user.user_metadata.avatar_url}
-                  alt="Avatar"
-                  className="w-12 h-12 rounded-full"
-                />
-              )}
-              <div className="text-left text-sm text-gray-600">
-                <p>{user.email}</p>
-                <p>GitHub: @{user.user_metadata.user_name}</p>
-              </div>
-            </div>
-            <button
-              onClick={handleLogout}
-              className="px-6 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
-            >
-              Sign out
-            </button>
-          </div>
-        ) : (
-          <div className="space-y-4">
-            <p className="text-gray-600 mb-6">
-              Monitor your CI/CD builds with AI-powered insights
-            </p>
-            <LoginButton />
-          </div>
-        )}
+        <h1 className="text-4xl font-bold text-white mb-4">Vantage</h1>
+        <p className="text-white/80 mb-8">
+          Monitor your full stack in one place
+        </p>
+        <LoginButton />
       </div>
     </div>
   );

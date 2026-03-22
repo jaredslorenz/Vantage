@@ -1,44 +1,33 @@
-import { cookies } from "next/headers";
+import { createServerSupabaseClient } from "@/lib/supabase/server";
+import { createOrUpdateUser } from "@/app/actions/user";
 import { NextResponse } from "next/server";
-import { createServerClient } from "@supabase/ssr";
 
 export async function GET(request: Request) {
-  const requestUrl = new URL(request.url);
-  const code = requestUrl.searchParams.get("code");
-  const origin = requestUrl.origin;
+  const { searchParams, origin } = new URL(request.url);
+  const code = searchParams.get("code");
 
   if (code) {
-    const cookieStore = await cookies();
-
-    const supabase = createServerClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-      {
-        cookies: {
-          getAll() {
-            return cookieStore.getAll();
-          },
-          setAll(cookiesToSet) {
-            try {
-              cookiesToSet.forEach(({ name, value, options }) =>
-                cookieStore.set(name, value, options),
-              );
-            } catch {
-              // The `setAll` method was called from a Server Component.
-              // This can be ignored if you have middleware refreshing
-              // user sessions.
-            }
-          },
-        },
-      },
-    );
-
+    const supabase = await createServerSupabaseClient();
     const { error } = await supabase.auth.exchangeCodeForSession(code);
 
-    if (error) {
-      console.error("Error exchanging code for session:", error);
+    if (!error) {
+      // Success - create/update user record
+      const result = await createOrUpdateUser();
+
+      if (result.error) {
+        console.error("Error creating user:", result.error);
+      } else {
+        console.log("User created/updated:", result.user?.id);
+      }
+
+      // Redirect to dashboard
+      return NextResponse.redirect(`${origin}/dashboard`);
+    } else {
+      // Log error and redirect to home
+      console.error("Auth callback error:", error);
     }
   }
 
+  // No code or error occurred - redirect to home
   return NextResponse.redirect(`${origin}/`);
 }
