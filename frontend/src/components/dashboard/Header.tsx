@@ -1,11 +1,12 @@
+"use client";
+
 export default function Header() {
   return (
     <div className="glass-header border-b border-white/30 px-7 py-3.5 flex items-center gap-4 shadow-sm">
-      {/* Search */}
-      <div className="flex-1 max-w-[480px]">
+      <div className="flex-1 max-w-120">
         <div className="relative">
           <svg
-            className="absolute left-3 top-1/2 -translate-y-1/2 w-[15px] h-[15px] text-gray-400 pointer-events-none"
+            className="absolute left-3 top-1/2 -translate-y-1/2 w-3.75 h-3.75 text-gray-400 pointer-events-none"
             fill="none"
             stroke="currentColor"
             strokeWidth="2"
@@ -20,11 +21,6 @@ export default function Header() {
           />
         </div>
       </div>
-
-      {/* Connect Service Button */}
-      <button className="bg-gradient-to-br from-brand-purple to-brand-cyan text-white px-4 py-2 rounded-button text-[13px] font-medium shadow-button hover:shadow-lg transition-shadow">
-        Connect Service
-      </button>
     </div>
   );
 }

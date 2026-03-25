@@ -26,6 +26,12 @@
   }
 }
 
+@layer base {
+  button {
+    @apply cursor-pointer transition-all duration-150 active:scale-[0.96];
+  }
+}
+
 @layer utilities {
   .glass {
     background: rgba(255, 255, 255, 0.8);
