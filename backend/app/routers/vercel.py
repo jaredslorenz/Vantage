@@ -201,6 +201,33 @@ async def remove_api_token(user_id: str = Depends(get_user_id)):
     return {"status": "removed"}
 
 
+class RedeployRequest(BaseModel):
+    deploymentId: str
+
+
+@router.post("/redeploy")
+async def redeploy(body: RedeployRequest, user_id: str = Depends(get_user_id)):
+    """Redeploy an existing Vercel deployment."""
+    token = _get_vercel_token(user_id)
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{VERCEL_API}/v13/deployments",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"deploymentId": body.deploymentId},
+        )
+
+    if resp.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail="Failed to trigger redeploy on Vercel")
+
+    d = resp.json()
+    return {
+        "id": d.get("id") or d.get("uid"),
+        "status": d.get("readyState", "BUILDING"),
+        "url": d.get("url"),
+    }
+
+
 @router.get("/projects")
 async def get_vercel_projects(user_id: str = Depends(get_user_id)):
     """Fetch the user's Vercel projects across personal and team scopes."""

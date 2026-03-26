@@ -71,14 +71,11 @@ export default function OverviewClient() {
         if (svcs.some((s) => s.service_type === "vercel")) {
           return apiFetch("/api/vercel/deployments?limit=5")
             .then((r) => r.json())
-            .then((d) => {
-              console.log("[deployments]", d);
-              setDeployments(d.deployments ?? []);
-            })
-            .catch((e) => console.error("[deployments error]", e));
+            .then((d) => setDeployments(d.deployments ?? []))
+            .catch(() => {});
         }
       })
-      .catch((e) => console.error("[services error]", e))
+      .catch(() => {})
       .finally(() => setLoading(false));
   }, []);
 

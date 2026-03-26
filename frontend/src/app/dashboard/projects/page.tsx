@@ -78,7 +78,7 @@ export default function ProjectsPage() {
         </div>
         <button
           onClick={() => setShowForm(true)}
-          className="text-[13px] font-medium px-4 py-2 rounded-button bg-linear-to-br from-brand-purple to-brand-cyan text-white shadow-button hover:shadow-lg transition-shadow"
+          className="text-[12px] font-medium px-3.5 py-1.5 rounded-button bg-white/20 backdrop-blur text-white hover:bg-white/30 transition-all border border-white/30"
         >
           New Project
         </button>
