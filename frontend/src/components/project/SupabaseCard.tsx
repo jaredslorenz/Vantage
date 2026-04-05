@@ -13,12 +13,13 @@ export const SB_COLOR: Record<string, string> = {
 };
 
 // --- Supabase card ---
-export function SupabaseCard({ service, health, overview, selected, onClick, onUnlink }: {
+export function SupabaseCard({ service, health, overview, selected, onClick, onUnlink, onInvestigate }: {
   service: ProjectService; health: SupabaseServiceHealth[]; overview: SupabaseOverview | null;
-  selected: boolean; onClick: () => void; onUnlink: () => void;
+  selected: boolean; onClick: () => void; onUnlink: () => void; onInvestigate?: () => void;
 }) {
   const healthyCount = health.filter((s) => s.status === "ACTIVE_HEALTHY").length;
   const anyUnhealthy = health.some((s) => s.status === "ACTIVE_UNHEALTHY");
+  const hasIssue = anyUnhealthy && health.length > 0;
   const overallColor = anyUnhealthy ? "#f87171" : health.length > 0 ? "#34d399" : "#fbbf24";
   const overallLabel = anyUnhealthy ? "Unhealthy" : health.length > 0 ? "Healthy" : "Starting";
   const totalRequests = overview?.api_stats.reduce((sum, p) => sum + p.count, 0) ?? null;
@@ -30,6 +31,8 @@ export function SupabaseCard({ service, health, overview, selected, onClick, onU
       className={`group relative w-full cursor-pointer rounded-card p-5 shadow-card transition-all duration-300 overflow-hidden
         ${selected
           ? "bg-white border-2 border-brand-purple shadow-[0_0_0_4px_rgba(111,123,247,0.12)]"
+          : hasIssue
+          ? "bg-linear-to-br from-red-50/80 to-white/95 border border-red-300 shadow-[0_0_0_4px_rgba(239,68,68,0.10)] hover:shadow-[0_0_0_4px_rgba(239,68,68,0.18)]"
           : "bg-white/95 border border-white/60 hover:border-brand-purple/50 hover:shadow-xl hover:-translate-y-0.5"
         }`}
     >
@@ -45,10 +48,17 @@ export function SupabaseCard({ service, health, overview, selected, onClick, onU
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: overallColor }} />
-            <span className="text-[11px] font-medium" style={{ color: overallColor }}>{overallLabel}</span>
-          </div>
+          {hasIssue ? (
+            <span className="flex items-center gap-1 text-[11px] font-semibold text-amber-600">
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+              Issue Detected
+            </span>
+          ) : (
+            <div className="flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: overallColor }} />
+              <span className="text-[11px] font-medium" style={{ color: overallColor }}>{overallLabel}</span>
+            </div>
+          )}
           <button
             onClick={(e) => { e.stopPropagation(); onUnlink(); }}
             title="Unlink"
@@ -81,7 +91,17 @@ export function SupabaseCard({ service, health, overview, selected, onClick, onU
         ))}
       </div>
 
-      <div className="flex items-center justify-between mt-1">
+      {hasIssue && (
+        <div className="mt-2.5 space-y-1.5">
+          {health.filter(s => s.status === "ACTIVE_UNHEALTHY").map(s => (
+            <div key={s.name} className="flex items-center gap-2 bg-red-50 border border-red-100 rounded-lg px-3 py-2">
+              <svg className="w-3 h-3 text-red-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+              <span className="text-[11px] text-red-600 capitalize">{s.name.replace(/_/g, " ")} unhealthy</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="flex items-center justify-between mt-3">
         <a
           href={`https://supabase.com/dashboard/project/${service.resource_id}`}
           target="_blank"
@@ -91,12 +111,21 @@ export function SupabaseCard({ service, health, overview, selected, onClick, onU
         >
           Open in Supabase ↗
         </a>
-        <div className={`flex items-center gap-1 text-[11px] font-medium transition-all duration-200 ${selected ? "text-brand-purple" : "text-gray-300 group-hover:text-brand-purple/60"}`}>
-          <span>{selected ? "Hide details" : "View details"}</span>
-          <svg className={`w-3 h-3 transition-transform duration-300 ${selected ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-            <path d="M19 9l-7 7-7-7" />
-          </svg>
-        </div>
+        {hasIssue && onInvestigate ? (
+          <button
+            onClick={(e) => { e.stopPropagation(); onInvestigate(); }}
+            className="text-[11px] font-semibold px-3 py-1.5 rounded-button bg-red-500 text-white hover:bg-red-600 transition-colors shadow-sm"
+          >
+            Investigate
+          </button>
+        ) : (
+          <div className={`flex items-center gap-1 text-[11px] font-medium transition-all duration-200 ${selected ? "text-brand-purple" : "text-gray-300 group-hover:text-brand-purple/60"}`}>
+            <span>{selected ? "Hide details" : "View details"}</span>
+            <svg className={`w-3 h-3 transition-transform duration-300 ${selected ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+              <path d="M19 9l-7 7-7-7" />
+            </svg>
+          </div>
+        )}
       </div>
     </div>
   );

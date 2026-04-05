@@ -109,6 +109,20 @@ export function BuildTrendChart({ items }: { items: ChartItem[] }) {
           <path d={linePath} fill="none" stroke="#6f7bf7" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
         </g>
 
+        {/* Failure markers — vertical red line + label */}
+        {items.map((it, i) => {
+          const isFail = it.status === "ERROR" || it.status === "build_failed";
+          if (!isFail) return null;
+          return (
+            <g key={`fail-${i}`}>
+              <line x1={xs[i]} y1={PAD_TOP} x2={xs[i]} y2={PAD_TOP + CHART_H} stroke="#f87171" strokeWidth="1.5" strokeDasharray="3 3" opacity="0.7" />
+              {/* Pin drop */}
+              <circle cx={xs[i]} cy={PAD_TOP - 6} r={5} fill="#f87171" />
+              <line x1={xs[i]} y1={PAD_TOP - 1} x2={xs[i]} y2={PAD_TOP} stroke="#f87171" strokeWidth="1.5" />
+            </g>
+          );
+        })}
+
         {/* Hover crosshair */}
         {hover !== null && (
           <line x1={xs[hover]} y1={PAD_TOP} x2={xs[hover]} y2={PAD_TOP + CHART_H} stroke="#e5e7eb" strokeWidth="1" strokeDasharray="3 3" />

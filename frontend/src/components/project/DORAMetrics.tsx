@@ -62,24 +62,21 @@ export function DORAMetrics({ deployments }: { deployments: Deployment[] }) {
   ];
 
   return (
-    <div className="px-5 py-3.5 border-b border-gray-100">
-      <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2.5">DORA Metrics</p>
-      <div className="flex gap-5">
-        {stats.map((s) => (
-          <div key={s.label} className="group relative">
-            <div className={`text-[15px] font-bold ${s.tier?.color ?? "text-gray-700"}`}>{s.value}</div>
-            <div className="text-[10px] text-gray-400 mt-0.5">{s.label}</div>
-            {s.tier && (
-              <span className={`inline-block text-[9px] font-semibold px-1 py-0.5 rounded mt-0.5 ${s.tier.color} ${s.tier.bg}`}>
-                {s.tier.label}
-              </span>
-            )}
-            <div className="absolute bottom-full left-0 mb-1.5 hidden group-hover:block z-10 pointer-events-none">
-              <div className="bg-gray-900 text-white text-[10px] px-2 py-1 rounded whitespace-nowrap">{s.tooltip}</div>
-            </div>
+    <div className="flex items-center gap-1.5 px-5 py-2 bg-gray-50/60">
+      <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mr-1">DORA</span>
+      {stats.map((s, i) => (
+        <div key={s.label} className="group relative flex items-center gap-1.5">
+          {i > 0 && <span className="text-gray-200">·</span>}
+          <span title={s.tooltip} className={`text-[11px] font-semibold ${s.tier?.color ?? "text-gray-600"} cursor-default`}>{s.value}</span>
+          <span className="text-[10px] text-gray-400">{s.label}</span>
+          {s.tier && (
+            <span className={`text-[9px] font-semibold px-1 py-0.5 rounded ${s.tier.color} ${s.tier.bg}`}>{s.tier.label}</span>
+          )}
+          <div className="absolute bottom-full left-0 mb-1.5 hidden group-hover:block z-10 pointer-events-none">
+            <div className="bg-gray-900 text-white text-[10px] px-2 py-1 rounded whitespace-nowrap">{s.tooltip}</div>
           </div>
-        ))}
-      </div>
+        </div>
+      ))}
     </div>
   );
 }

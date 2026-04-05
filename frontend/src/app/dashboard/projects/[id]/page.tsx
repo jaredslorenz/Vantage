@@ -13,7 +13,6 @@ import type {
 import { InsightPanel } from "@/components/project/InsightPanel";
 import { BuildTrendChart } from "@/components/project/BuildTrendChart";
 import { DORAMetrics } from "@/components/project/DORAMetrics";
-import { StatusDot, CopyButton, STATE_COLOR, STATE_LABEL, STATE_BG, RENDER_COLOR, RENDER_LABEL, RENDER_BG } from "@/components/project/StatusDot";
 import { DeploymentRow } from "@/components/project/DeploymentRow";
 import { VercelCard } from "@/components/project/VercelCard";
 import { RenderCard, RenderDeployRow } from "@/components/project/RenderCard";
@@ -467,6 +466,47 @@ export default function ProjectPage() {
         </div>
       </div>
 
+      {/* Alert banner — surfaces critical service issues at a glance */}
+      {(() => {
+        const alerts: { service: string; message: string; svcId: string }[] = [];
+        const renderSvc = project.project_services.find(s => s.service_type === "render");
+        if (renderSvc && renderDeploys.length >= 3) {
+          const live = renderDeploys.filter(d => d.status === "live").length;
+          const rate = Math.round(live / renderDeploys.length * 100);
+          if (rate < 50) alerts.push({ service: "Render", message: `Render has a ${rate}% success rate in the last ${renderDeploys.length} deploys. Investigate immediately.`, svcId: renderSvc.id });
+        }
+        const vercelSvc = project.project_services.find(s => s.service_type === "vercel");
+        if (vercelSvc && deployments.length >= 3) {
+          const ready = deployments.filter(d => d.state === "READY").length;
+          const rate = Math.round(ready / deployments.length * 100);
+          if (rate < 50) alerts.push({ service: "Vercel", message: `Vercel has a ${rate}% success rate across recent deployments. Investigate immediately.`, svcId: vercelSvc.id });
+        }
+        const supabaseSvc = project.project_services.find(s => s.service_type === "supabase");
+        if (supabaseSvc && supabaseHealth.some(s => s.status === "ACTIVE_UNHEALTHY")) {
+          const unhealthy = supabaseHealth.filter(s => s.status === "ACTIVE_UNHEALTHY").map(s => s.name.replace(/_/g, " ")).join(", ");
+          alerts.push({ service: "Supabase", message: `Supabase reports unhealthy services: ${unhealthy}. Investigate immediately.`, svcId: supabaseSvc.id });
+        }
+        if (alerts.length === 0) return null;
+        const alert = alerts[0];
+        return (
+          <div className="mb-5 flex items-center justify-between gap-4 bg-amber-50 border border-amber-200 rounded-card px-5 py-4 shadow-card animate-slide-up">
+            <div className="flex items-start gap-3">
+              <span className="text-xl shrink-0">⚠️</span>
+              <div>
+                <p className="text-[13px] font-semibold text-amber-900">Deployment Issue Detected</p>
+                <p className="text-[12px] text-amber-700 mt-0.5">{alert.message}</p>
+              </div>
+            </div>
+            <button
+              onClick={() => setSelectedService(alert.svcId)}
+              className="shrink-0 text-[12px] font-semibold px-4 py-2 rounded-button bg-red-500 text-white hover:bg-red-600 transition-colors shadow-sm"
+            >
+              Investigate
+            </button>
+          </div>
+        );
+      })()}
+
       {/* AI Insight */}
       {project.project_services.length > 0 && <InsightPanel projectId={project.id} refreshKey={insightRefreshKey} />}
 
@@ -486,16 +526,16 @@ export default function ProjectPage() {
         <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-3.5 mb-6">
           {project.project_services.map((svc) => {
             if (svc.service_type === "vercel") {
-              return <VercelCard key={svc.id} service={svc} deployments={deployments} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} uptime={uptimeData[`vercel:${svc.resource_id}`]} />;
+              return <VercelCard key={svc.id} service={svc} deployments={deployments} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} uptime={uptimeData[`vercel:${svc.resource_id}`]} onInvestigate={() => setSelectedService(svc.id)} />;
             }
             if (svc.service_type === "github") {
               return <GitHubCard key={svc.id} service={svc} commits={commits} pulls={pulls} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
             }
             if (svc.service_type === "render") {
-              return <RenderCard key={svc.id} service={svc} deploys={renderDeploys} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
+              return <RenderCard key={svc.id} service={svc} deploys={renderDeploys} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} onInvestigate={() => setSelectedService(svc.id)} />;
             }
             if (svc.service_type === "supabase") {
-              return <SupabaseCard key={svc.id} service={svc} health={supabaseHealth} overview={supabaseOverview} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
+              return <SupabaseCard key={svc.id} service={svc} health={supabaseHealth} overview={supabaseOverview} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} onInvestigate={() => setSelectedService(svc.id)} />;
             }
             return null;
           })}
@@ -635,7 +675,7 @@ export default function ProjectPage() {
             );
           })()}
 
-          <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100">
+          <>
             {activeService.service_type === "vercel" && (() => {
               const githubSvc = project.project_services.find(s => s.service_type === "github");
               const vercelUptime = uptimeData[`vercel:${activeService.resource_id}`];
@@ -643,7 +683,7 @@ export default function ProjectPage() {
               // --- Env vars tab ---
               if (vercelDetailTab === "env") {
                 return (
-                  <>
+                  <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100">
                     <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
                       <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Environment Variables</p>
                       <p className="text-[11px] text-gray-400 mt-0.5">Values are redacted — names only</p>
@@ -674,7 +714,7 @@ export default function ProjectPage() {
                         </div>
                       ))
                     )}
-                  </>
+                  </div>
                 );
               }
 
@@ -696,37 +736,38 @@ export default function ProjectPage() {
 
               return (
                 <>
-                  <BuildTrendChart items={deployments.filter(d => d.build_duration != null).slice(0, 12).reverse().map(d => ({
-                    label: d.commit_sha?.slice(0, 5) ?? "—",
-                    duration: d.build_duration!,
-                    status: d.state,
-                    commit: d.commit_message ?? "",
-                    ts: d.created_at,
-                  }))} />
-                  <DORAMetrics deployments={deployments} />
-
-                  {/* Uptime history strip */}
-                  {vercelUptime && vercelUptime.checks.length > 0 && (
-                    <div className="px-5 py-3 border-b border-gray-100">
-                      <div className="flex items-center justify-between mb-1.5">
-                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Uptime</p>
-                        <div className="flex items-center gap-3 text-[10px] text-gray-400">
-                          {vercelUptime.uptime_pct != null && <span className="font-medium text-gray-600">{vercelUptime.uptime_pct}%</span>}
-                          {vercelUptime.avg_latency_ms != null && <span>{vercelUptime.avg_latency_ms}ms avg</span>}
+                  {/* Chart card */}
+                  <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100 mb-3">
+                    <BuildTrendChart items={deployments.filter(d => d.build_duration != null).slice(0, 12).reverse().map(d => ({
+                      label: d.commit_sha?.slice(0, 5) ?? "—",
+                      duration: d.build_duration!,
+                      status: d.state,
+                      commit: d.commit_message ?? "",
+                      ts: d.created_at,
+                    }))} />
+                    <DORAMetrics deployments={deployments} />
+                    {vercelUptime && vercelUptime.checks.length > 0 && (
+                      <div className="px-5 py-3">
+                        <div className="flex items-center justify-between mb-1.5">
+                          <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Uptime</p>
+                          <div className="flex items-center gap-3 text-[10px] text-gray-400">
+                            {vercelUptime.uptime_pct != null && <span className="font-medium text-gray-600">{vercelUptime.uptime_pct}%</span>}
+                            {vercelUptime.avg_latency_ms != null && <span>{vercelUptime.avg_latency_ms}ms avg</span>}
+                          </div>
+                        </div>
+                        <div className="flex gap-0.5">
+                          {vercelUptime.checks.map((c, i) => (
+                            <div key={i} title={`${c.is_up ? "Up" : "Down"} — ${new Date(c.checked_at).toLocaleString()}`}
+                              className={`flex-1 h-5 rounded-sm ${c.is_up ? "bg-emerald-400/70" : "bg-red-400/80"}`} />
+                          ))}
                         </div>
                       </div>
-                      <div className="flex gap-0.5">
-                        {vercelUptime.checks.map((c, i) => (
-                          <div key={i} title={`${c.is_up ? "Up" : "Down"} — ${new Date(c.checked_at).toLocaleString()}`}
-                            className={`flex-1 h-5 rounded-sm ${c.is_up ? "bg-emerald-400/70" : "bg-red-400/80"}`} />
-                        ))}
-                      </div>
-                    </div>
-                  )}
+                    )}
+                  </div>
 
                   {/* Proactive failure alerts */}
                   {Object.entries(proactiveAlerts).map(([depId, alert]) => (
-                    <div key={depId} className="mx-5 mt-3 rounded-lg border border-red-200 bg-red-50/60 px-4 py-3 animate-slide-up">
+                    <div key={depId} className="mb-3 rounded-card border border-red-200 bg-red-50/60 px-4 py-3 animate-slide-up">
                       <div className="flex items-start justify-between gap-3">
                         <div className="flex items-start gap-2">
                           <svg className="w-3.5 h-3.5 text-red-500 mt-0.5 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -743,207 +784,223 @@ export default function ProjectPage() {
                     </div>
                   ))}
 
-                  {/* Filter bar */}
-                  <div className="flex items-center gap-1 px-5 py-2.5 border-b border-gray-100">
-                    {FILTERS.map(f => (
-                      <button
-                        key={f.key}
-                        onClick={() => setVercelFilter(f.key)}
-                        className={`text-[11px] font-medium px-2.5 py-1 rounded-button transition-all ${
-                          vercelFilter === f.key ? "bg-gray-900 text-white" : "text-gray-400 hover:text-gray-600 hover:bg-gray-100"
-                        }`}
-                      >
-                        {"count" in f && f.count > 0 ? `${f.label} (${f.count})` : f.label}
-                      </button>
-                    ))}
-                  </div>
-                  {filtered.length === 0
-                    ? <p className="text-sm text-gray-400 text-center py-12">No deployments match this filter</p>
-                    : groups.map((group) => (
-                        <div key={group.label}>
-                          <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
-                            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{group.label}</span>
+                  {/* Deployment history card */}
+                  <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100">
+                    <div className="flex items-center gap-1 px-5 py-2.5">
+                      <span className="text-[11px] font-semibold text-gray-700 mr-2">Deployment History</span>
+                      {FILTERS.map(f => (
+                        <button
+                          key={f.key}
+                          onClick={() => setVercelFilter(f.key)}
+                          className={`text-[11px] font-medium px-2.5 py-1 rounded-button transition-all ${
+                            vercelFilter === f.key ? "bg-gray-900 text-white" : "text-gray-400 hover:text-gray-600 hover:bg-gray-100"
+                          }`}
+                        >
+                          {"count" in f && f.count > 0 ? `${f.label} (${f.count})` : f.label}
+                        </button>
+                      ))}
+                    </div>
+                    {filtered.length === 0
+                      ? <p className="text-sm text-gray-400 text-center py-12">No deployments match this filter</p>
+                      : groups.map((group) => (
+                          <div key={group.label}>
+                            <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
+                              <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{group.label}</span>
+                            </div>
+                            {group.items.map((d, i) => (
+                              <DeploymentRow
+                                key={d.id}
+                                deployment={d}
+                                index={i}
+                                maxBuildDuration={maxBuildDuration}
+                                githubRepo={githubSvc?.resource_id}
+                                initialAnalysis={proactiveAlerts[d.id]}
+                                onViewLogs={(depId, name) => setLogDrawer({ logsUrl: `/api/vercel/deployments/${depId}/logs`, title: "Build Logs", subtitle: name })}
+                                onRedeploy={async (depId) => {
+                                  setDeploying(true);
+                                  try {
+                                    const res = await apiFetch("/api/vercel/redeploy", { method: "POST", body: JSON.stringify({ deploymentId: depId }) });
+                                    if (res.ok) {
+                                      const nd = await res.json();
+                                      setDeployments((prev) => [{ ...d, id: nd.id, state: "BUILDING", created_at: Date.now() }, ...prev]);
+                                    }
+                                  } finally { setDeploying(false); }
+                                }}
+                              />
+                            ))}
                           </div>
-                          {group.items.map((d, i) => (
-                            <DeploymentRow
-                              key={d.id}
-                              deployment={d}
-                              index={i}
-                              maxBuildDuration={maxBuildDuration}
-                              githubRepo={githubSvc?.resource_id}
-                              initialAnalysis={proactiveAlerts[d.id]}
-                              onViewLogs={(depId, name) => setLogDrawer({ logsUrl: `/api/vercel/deployments/${depId}/logs`, title: "Build Logs", subtitle: name })}
-                              onRedeploy={async (depId) => {
-                                setDeploying(true);
-                                try {
-                                  const res = await apiFetch("/api/vercel/redeploy", { method: "POST", body: JSON.stringify({ deploymentId: depId }) });
-                                  if (res.ok) {
-                                    const nd = await res.json();
-                                    setDeployments((prev) => [{ ...d, id: nd.id, state: "BUILDING", created_at: Date.now() }, ...prev]);
-                                  }
-                                } finally { setDeploying(false); }
-                              }}
-                            />
-                          ))}
-                        </div>
-                      ))
-                  }
+                        ))
+                    }
+                  </div>
                 </>
               );
             })()}
-            {activeService.service_type === "github" && githubTab === "commits" && (
-              commits.length === 0
-                ? <p className="text-sm text-gray-400 text-center py-12">No commits found</p>
-                : commits.map((c, i) => <CommitRow key={c.sha} commit={c} index={i} />)
-            )}
-            {activeService.service_type === "github" && githubTab === "prs" && (
-              pulls.length === 0
-                ? <p className="text-sm text-gray-400 text-center py-12">No pull requests found</p>
-                : pulls.map((p, i) => <PRRow key={p.number} pr={p} index={i} />)
+            {activeService.service_type === "github" && (
+              <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100">
+                {githubTab === "commits" && (
+                  commits.length === 0
+                    ? <p className="text-sm text-gray-400 text-center py-12">No commits found</p>
+                    : commits.map((c, i) => <CommitRow key={c.sha} commit={c} index={i} />)
+                )}
+                {githubTab === "prs" && (
+                  pulls.length === 0
+                    ? <p className="text-sm text-gray-400 text-center py-12">No pull requests found</p>
+                    : pulls.map((p, i) => <PRRow key={p.number} pr={p} index={i} />)
+                )}
+              </div>
             )}
             {activeService.service_type === "render" && (() => {
               const groups = groupByDate(renderDeploys);
               return (
                 <>
-                  <BuildTrendChart items={renderDeploys.filter(d => d.finished_at).slice(0, 12).reverse().map(d => ({
-                    label: d.commit_id?.slice(0, 5) ?? "—",
-                    duration: Math.round((new Date(d.finished_at!).getTime() - new Date(d.created_at).getTime()) / 1000),
-                    status: d.status,
-                    commit: d.commit_message ?? "",
-                    ts: new Date(d.created_at).getTime(),
-                  }))} />
-                  {renderDeploys.length === 0
-                    ? <p className="text-sm text-gray-400 text-center py-12">No deploys found</p>
-                    : groups.map((group) => (
-                        <div key={group.label}>
-                          <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
-                            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{group.label}</span>
-                          </div>
-                          {group.items.map((d, i) => (
-                            <RenderDeployRow
-                              key={d.id}
-                              deploy={d}
-                              index={i}
-                              serviceId={activeService.resource_id}
-                              onViewLogs={(url, subtitle) => setLogDrawer({ logsUrl: url, title: "Deploy Logs", subtitle })}
-                              onRedeploy={async (svcId) => {
-                                setDeploying(true);
-                                try {
-                                  const res = await apiFetch("/api/render/deploy", { method: "POST", body: JSON.stringify({ serviceId: svcId }) });
-                                  if (res.ok) { const nd = await res.json(); setRenderDeploys((prev) => [{ ...d, id: nd.id, status: "build_in_progress", created_at: nd.created_at }, ...prev]); }
-                                } finally { setDeploying(false); }
-                              }}
-                            />
-                          ))}
-                        </div>
-                      ))
-                  }
-              </>
-              );
-            })()}
-            {activeService.service_type === "supabase" && supabaseTab === "overview" && (
-              <>
-                {/* Service health */}
-                <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
-                  <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Services</p>
-                  <div className="flex flex-wrap gap-3">
-                    {supabaseHealth.length === 0
-                      ? <p className="text-[12px] text-gray-400">Loading…</p>
-                      : supabaseHealth.map((s) => (
-                          <div key={s.name} className="flex items-center gap-1.5">
-                            <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: SB_COLOR[s.status] ?? "#d1d5db" }} />
-                            <span className="text-[12px] text-gray-600 capitalize">{s.name.replace(/_/g, " ")}</span>
+                  {/* Chart card */}
+                  <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100 mb-3">
+                    <BuildTrendChart items={renderDeploys.filter(d => d.finished_at).slice(0, 12).reverse().map(d => ({
+                      label: d.commit_id?.slice(0, 5) ?? "—",
+                      duration: Math.round((new Date(d.finished_at!).getTime() - new Date(d.created_at).getTime()) / 1000),
+                      status: d.status,
+                      commit: d.commit_message ?? "",
+                      ts: new Date(d.created_at).getTime(),
+                    }))} />
+                  </div>
+                  {/* Deploy history card */}
+                  <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100">
+                    <div className="px-5 py-2.5 border-b border-gray-100">
+                      <span className="text-[11px] font-semibold text-gray-700">Deployment History</span>
+                    </div>
+                    {renderDeploys.length === 0
+                      ? <p className="text-sm text-gray-400 text-center py-12">No deploys found</p>
+                      : groups.map((group) => (
+                          <div key={group.label}>
+                            <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
+                              <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{group.label}</span>
+                            </div>
+                            {group.items.map((d, i) => (
+                              <RenderDeployRow
+                                key={d.id}
+                                deploy={d}
+                                index={i}
+                                serviceId={activeService.resource_id}
+                                onViewLogs={(url, subtitle) => setLogDrawer({ logsUrl: url, title: "Deploy Logs", subtitle })}
+                                onRedeploy={async (svcId) => {
+                                  setDeploying(true);
+                                  try {
+                                    const res = await apiFetch("/api/render/deploy", { method: "POST", body: JSON.stringify({ serviceId: svcId }) });
+                                    if (res.ok) { const nd = await res.json(); setRenderDeploys((prev) => [{ ...d, id: nd.id, status: "build_in_progress", created_at: nd.created_at }, ...prev]); }
+                                  } finally { setDeploying(false); }
+                                }}
+                              />
+                            ))}
                           </div>
                         ))
                     }
                   </div>
-                </div>
-                {/* API request volume */}
-                {supabaseOverview?.available.api_stats === false ? (
-                  <div className="px-5 py-4 text-[12px] text-gray-400">API stats not available for this plan</div>
-                ) : !supabaseOverview ? (
-                  <div className="px-5 py-4 text-[12px] text-gray-400">Loading…</div>
-                ) : supabaseOverview.api_stats.length === 0 ? (
-                  <div className="px-5 py-4 text-[12px] text-gray-400">No API traffic data yet</div>
-                ) : (
+                </>
+              );
+            })()}
+            {activeService.service_type === "supabase" && (
+              <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100">
+                {supabaseTab === "overview" && (
                   <>
-                    <div className="px-5 pt-3 pb-1">
-                      <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">API Requests — Last 7 Days</p>
-                      <div className="flex items-end gap-1 h-16">
-                        {(() => {
-                          const max = Math.max(...supabaseOverview.api_stats.map((p) => p.count), 1);
-                          return supabaseOverview.api_stats.slice(-7).map((point, i) => (
-                            <div key={i} className="flex-1 flex flex-col items-center gap-1 group relative">
-                              <div
-                                className="w-full rounded-sm bg-brand-purple/40 hover:bg-brand-purple/70 transition-colors"
-                                style={{ height: `${Math.max(4, (point.count / max) * 56)}px` }}
-                              />
-                              <span className="text-[9px] text-gray-400 tabular-nums">
-                                {point.count >= 1000 ? `${(point.count / 1000).toFixed(1)}k` : point.count}
-                              </span>
-                              <div suppressHydrationWarning className="absolute -top-6 left-1/2 -translate-x-1/2 bg-gray-800 text-white text-[10px] px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
-                                {new Date(point.timestamp).toLocaleDateString("en-US", { month: "short", day: "numeric" })}: {point.count.toLocaleString()}
+                    <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
+                      <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Services</p>
+                      <div className="flex flex-wrap gap-3">
+                        {supabaseHealth.length === 0
+                          ? <p className="text-[12px] text-gray-400">Loading…</p>
+                          : supabaseHealth.map((s) => (
+                              <div key={s.name} className="flex items-center gap-1.5">
+                                <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: SB_COLOR[s.status] ?? "#d1d5db" }} />
+                                <span className="text-[12px] text-gray-600 capitalize">{s.name.replace(/_/g, " ")}</span>
                               </div>
-                            </div>
-                          ));
-                        })()}
+                            ))
+                        }
                       </div>
                     </div>
+                    {supabaseOverview?.available.api_stats === false ? (
+                      <div className="px-5 py-4 text-[12px] text-gray-400">API stats not available for this plan</div>
+                    ) : !supabaseOverview ? (
+                      <div className="px-5 py-4 text-[12px] text-gray-400">Loading…</div>
+                    ) : supabaseOverview.api_stats.length === 0 ? (
+                      <div className="px-5 py-4 text-[12px] text-gray-400">No API traffic data yet</div>
+                    ) : (
+                      <div className="px-5 pt-3 pb-1">
+                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">API Requests — Last 7 Days</p>
+                        <div className="flex items-end gap-1 h-16">
+                          {(() => {
+                            const max = Math.max(...supabaseOverview.api_stats.map((p) => p.count), 1);
+                            return supabaseOverview.api_stats.slice(-7).map((point, i) => (
+                              <div key={i} className="flex-1 flex flex-col items-center gap-1 group relative">
+                                <div
+                                  className="w-full rounded-sm bg-brand-purple/40 hover:bg-brand-purple/70 transition-colors"
+                                  style={{ height: `${Math.max(4, (point.count / max) * 56)}px` }}
+                                />
+                                <span className="text-[9px] text-gray-400 tabular-nums">
+                                  {point.count >= 1000 ? `${(point.count / 1000).toFixed(1)}k` : point.count}
+                                </span>
+                                <div suppressHydrationWarning className="absolute -top-6 left-1/2 -translate-x-1/2 bg-gray-800 text-white text-[10px] px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
+                                  {new Date(point.timestamp).toLocaleDateString("en-US", { month: "short", day: "numeric" })}: {point.count.toLocaleString()}
+                                </div>
+                              </div>
+                            ));
+                          })()}
+                        </div>
+                      </div>
+                    )}
                   </>
                 )}
-              </>
+                {supabaseTab === "logs" && (
+                  !supabaseOverview ? (
+                    <p className="text-sm text-gray-400 text-center py-12">Loading…</p>
+                  ) : supabaseOverview.available.logs === false ? (
+                    <p className="text-sm text-gray-400 text-center py-12">Log access not available for this plan</p>
+                  ) : supabaseOverview.error_logs.length === 0 ? (
+                    <div className="flex flex-col items-center py-12 gap-2">
+                      <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                      <p className="text-sm text-gray-400">No errors in the last 24h</p>
+                    </div>
+                  ) : supabaseOverview.error_logs.map((log, i) => (
+                    <div key={i} className="px-5 py-3 border-b border-gray-100 last:border-0 hover:bg-gray-50/40 transition-colors">
+                      <div className="flex items-center gap-2 mb-1">
+                        {log.status && (
+                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${log.status >= 500 ? "text-red-600 bg-red-50" : "text-amber-600 bg-amber-50"}`}>
+                            {log.status}
+                          </span>
+                        )}
+                        <span suppressHydrationWarning className="text-[11px] text-gray-400 shrink-0">
+                          {new Date(log.timestamp).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}
+                        </span>
+                      </div>
+                      <p className="text-[12px] text-gray-700 font-mono truncate">{log.message || "—"}</p>
+                    </div>
+                  ))
+                )}
+                {supabaseTab === "history" && (
+                  !supabaseOverview ? (
+                    <p className="text-sm text-gray-400 text-center py-12">Loading…</p>
+                  ) : supabaseOverview.available.actions === false ? (
+                    <p className="text-sm text-gray-400 text-center py-12">Action history not available</p>
+                  ) : supabaseOverview.actions.length === 0 ? (
+                    <p className="text-sm text-gray-400 text-center py-12">No actions found</p>
+                  ) : supabaseOverview.actions.map((action) => (
+                    <div key={action.id} className="flex items-center justify-between px-5 py-3.5 border-b border-gray-100 last:border-0">
+                      <div className="flex items-center gap-2.5">
+                        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
+                          action.status === "COMPLETED" ? "text-emerald-600 bg-emerald-50" :
+                          action.status === "FAILED" ? "text-red-500 bg-red-50" :
+                          action.status === "IN_PROGRESS" ? "text-amber-500 bg-amber-50" :
+                          "text-gray-500 bg-gray-100"
+                        }`}>{action.status}</span>
+                        {action.error_message && (
+                          <span className="text-[12px] text-gray-500 truncate max-w-50">{action.error_message}</span>
+                        )}
+                      </div>
+                      <span suppressHydrationWarning className="text-[11px] text-gray-400 shrink-0">{timeAgo(new Date(action.created_at).getTime())}</span>
+                    </div>
+                  ))
+                )}
+              </div>
             )}
-            {activeService.service_type === "supabase" && supabaseTab === "logs" && (
-              !supabaseOverview ? (
-                <p className="text-sm text-gray-400 text-center py-12">Loading…</p>
-              ) : supabaseOverview.available.logs === false ? (
-                <p className="text-sm text-gray-400 text-center py-12">Log access not available for this plan</p>
-              ) : supabaseOverview.error_logs.length === 0 ? (
-                <div className="flex flex-col items-center py-12 gap-2">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                  <p className="text-sm text-gray-400">No errors in the last 24h</p>
-                </div>
-              ) : supabaseOverview.error_logs.map((log, i) => (
-                <div key={i} className="px-5 py-3 border-b border-gray-100 last:border-0 hover:bg-gray-50/40 transition-colors">
-                  <div className="flex items-center gap-2 mb-1">
-                    {log.status && (
-                      <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${log.status >= 500 ? "text-red-600 bg-red-50" : "text-amber-600 bg-amber-50"}`}>
-                        {log.status}
-                      </span>
-                    )}
-                    <span suppressHydrationWarning className="text-[11px] text-gray-400 shrink-0">
-                      {new Date(log.timestamp).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}
-                    </span>
-                  </div>
-                  <p className="text-[12px] text-gray-700 font-mono truncate">{log.message || "—"}</p>
-                </div>
-              ))
-            )}
-            {activeService.service_type === "supabase" && supabaseTab === "history" && (
-              !supabaseOverview ? (
-                <p className="text-sm text-gray-400 text-center py-12">Loading…</p>
-              ) : supabaseOverview.available.actions === false ? (
-                <p className="text-sm text-gray-400 text-center py-12">Action history not available</p>
-              ) : supabaseOverview.actions.length === 0 ? (
-                <p className="text-sm text-gray-400 text-center py-12">No actions found</p>
-              ) : supabaseOverview.actions.map((action) => (
-                <div key={action.id} className="flex items-center justify-between px-5 py-3.5 border-b border-gray-100 last:border-0">
-                  <div className="flex items-center gap-2.5">
-                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
-                      action.status === "COMPLETED" ? "text-emerald-600 bg-emerald-50" :
-                      action.status === "FAILED" ? "text-red-500 bg-red-50" :
-                      action.status === "IN_PROGRESS" ? "text-amber-500 bg-amber-50" :
-                      "text-gray-500 bg-gray-100"
-                    }`}>{action.status}</span>
-                    {action.error_message && (
-                      <span className="text-[12px] text-gray-500 truncate max-w-50">{action.error_message}</span>
-                    )}
-                  </div>
-                  <span suppressHydrationWarning className="text-[11px] text-gray-400 shrink-0">{timeAgo(new Date(action.created_at).getTime())}</span>
-                </div>
-              ))
-            )}
-          </div>
+          </>
         </div>
       )}
 
