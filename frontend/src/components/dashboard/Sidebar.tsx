@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { LuLayoutDashboard, LuFolderKanban, LuPlug, LuActivity, LuSettings2 } from "react-icons/lu";
+import { VantageIcon } from "@/components/VantageLogo";
 
 const NAV_ITEMS = [
   { href: "/dashboard",           label: "Overview",  Icon: LuLayoutDashboard },
@@ -13,37 +13,32 @@ const NAV_ITEMS = [
   { href: "/dashboard/settings",  label: "Settings",  Icon: LuSettings2 },
 ];
 
-export default function Sidebar() {
-  const [collapsed, setCollapsed] = useState(false);
+export default function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
   const pathname = usePathname();
 
   return (
     <div
       className={`${
         collapsed ? "w-20" : "w-55"
-      } min-w-20 overflow-visible glass border-r border-white/40 flex flex-col shadow-glass transition-all duration-300`}
+      } shrink-0 overflow-hidden glass border-r border-white/40 flex flex-col shadow-glass transition-all duration-300`}
     >
       {/* Header */}
-      <div className="px-3 h-16 border-b border-black/5 flex items-center justify-between">
+      <div className={`px-3 h-16 border-b border-black/5 flex items-center ${collapsed ? "justify-center" : "justify-between"}`}>
         {!collapsed && (
-          <div>
-            <div className="text-base font-medium text-gray-900 tracking-tight">
-              Vantage
+          <Link href="/" className="flex items-center gap-3 min-w-0 hover:opacity-80 transition-opacity">
+            <VantageIcon size={34} />
+            <div className="min-w-0">
+              <div className="text-[16px] font-semibold text-gray-900 leading-tight">Vantage</div>
+              <div className="text-[11px] text-brand-purple font-medium">DevOps Hub</div>
             </div>
-            <div className="text-[11px] text-brand-purple font-medium mt-1">
-              DevOps Hub
-            </div>
-          </div>
+          </Link>
         )}
-
         <button
-          onClick={() => setCollapsed(!collapsed)}
+          onClick={onToggle}
           className="p-2 rounded-lg hover:bg-white/40 transition-colors flex items-center justify-center"
         >
           <svg
-            className={`w-5 h-5 text-gray-600 transition-transform ${
-              collapsed ? "rotate-180" : ""
-            }`}
+            className={`w-5 h-5 text-gray-600 transition-transform ${collapsed ? "rotate-180" : ""}`}
             fill="none"
             stroke="currentColor"
             strokeWidth="2"

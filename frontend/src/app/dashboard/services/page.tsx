@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { SiRender } from "react-icons/si";
+import { SiRender, SiSupabase } from "react-icons/si";
 import { useSearchParams } from "next/navigation";
 import { apiFetch } from "@/lib/api";
 
@@ -103,13 +103,34 @@ const SERVICE_META: Record<
     ],
     revokeUrl: "https://dashboard.render.com/u/settings#api-keys",
     revokeLabel: "dashboard.render.com/settings",
-    logo: (
-      <SiRender className="w-5 h-5" />
+    logo: <SiRender className="w-5 h-5" />,
+  },
+  supabase: {
+    label: "Supabase",
+    description: "Database health, project status, and service uptime",
+    tokenPlaceholder: "sbp_...",
+    tokenHint: (
+      <>
+        Create a{" "}
+        <a href="https://supabase.com/dashboard/account/tokens" target="_blank" rel="noopener noreferrer" className="text-brand-purple underline underline-offset-2">
+          Personal Access Token
+        </a>{" "}
+        in your Supabase account settings.
+      </>
     ),
+    dataAccess: [
+      "Project names and regions",
+      "Database health status",
+      "Auth, storage, realtime health",
+      "Organization info",
+    ],
+    revokeUrl: "https://supabase.com/dashboard/account/tokens",
+    revokeLabel: "supabase.com/dashboard/account/tokens",
+    logo: <SiSupabase className="w-5 h-5" />,
   },
 };
 
-const AVAILABLE_SERVICES = ["vercel", "github", "render"];
+const AVAILABLE_SERVICES = ["vercel", "github", "render", "supabase"];
 
 const ERROR_MESSAGES: Record<string, string> = {
   oauth_failed: "Authorization was denied or failed. Please try again.",
@@ -272,6 +293,7 @@ export default function ServicesPage() {
       vercel: "/api/vercel/disconnect",
       github: "/api/github/disconnect",
       render: "/api/render/disconnect",
+      supabase: "/api/supabase/disconnect",
     };
     await apiFetch(urls[serviceType] ?? `/api/${serviceType}/disconnect`, { method: "DELETE" });
     setConnected((prev) => prev.filter((s) => s.service_type !== serviceType));

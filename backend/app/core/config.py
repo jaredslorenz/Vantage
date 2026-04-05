@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     # Anthropic
     anthropic_api_key: str = ""
 
+    # OpenAI
+    openai_api_key: str = ""
+
     class Config:
         env_file = ".env"
         extra = "ignore"

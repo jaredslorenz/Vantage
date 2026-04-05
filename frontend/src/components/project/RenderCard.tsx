@@ -1,0 +1,174 @@
+"use client";
+
+import { useState } from "react";
+import { SiRender } from "react-icons/si";
+import { timeAgo } from "@/lib/utils";
+import type { RenderDeploy, ProjectService } from "@/types/project";
+import { RENDER_COLOR, RENDER_LABEL, RENDER_BG, CopyButton } from "@/components/project/StatusDot";
+
+// --- Render card ---
+export function RenderCard({ service, deploys, selected, onClick, onUnlink }: {
+  service: ProjectService; deploys: RenderDeploy[]; selected: boolean; onClick: () => void; onUnlink: () => void;
+}) {
+  const latest = deploys[0];
+  const liveCount = deploys.filter((d) => d.status === "live").length;
+  const successRate = deploys.length ? Math.round((liveCount / deploys.length) * 100) : null;
+  const isBuilding = latest?.status === "build_in_progress" || latest?.status === "update_in_progress";
+
+  return (
+    <div
+      onClick={onClick}
+      className={`group relative w-full cursor-pointer rounded-card p-5 shadow-card transition-all duration-300 overflow-hidden
+        ${selected
+          ? "bg-white border-2 border-brand-purple shadow-[0_0_0_4px_rgba(111,123,247,0.12)]"
+          : "bg-white/95 border border-white/60 hover:border-brand-purple/50 hover:shadow-xl hover:-translate-y-0.5"
+        }`}
+    >
+      {selected && <div className="absolute inset-0 bg-linear-to-br from-brand-purple/5 to-brand-cyan/5 pointer-events-none" />}
+      <div className="flex items-start justify-between mb-4">
+        <div className="flex items-center gap-2.5">
+          <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-white transition-all duration-300 ${selected ? "bg-linear-to-br from-brand-purple to-brand-cyan shadow-button" : "bg-gray-900"}`}>
+            <SiRender className="w-4 h-4" />
+          </div>
+          <div>
+            <div className="text-[14px] font-semibold text-gray-900">Render</div>
+            <div className="text-[11px] text-gray-400">{service.resource_name}</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {latest && (
+            <div className="flex items-center gap-1.5">
+              <span className="relative flex items-center justify-center w-2.5 h-2.5 shrink-0">
+                {isBuilding && <span className="absolute inline-flex w-full h-full rounded-full opacity-75 animate-ping" style={{ background: RENDER_COLOR[latest.status] }} />}
+                <span className="relative inline-flex w-2.5 h-2.5 rounded-full" style={{ background: RENDER_COLOR[latest.status] ?? "#d1d5db" }} />
+              </span>
+              <span className="text-[11px] font-medium" style={{ color: RENDER_COLOR[latest.status] ?? "#d1d5db" }}>{RENDER_LABEL[latest.status] ?? latest.status}</span>
+            </div>
+          )}
+          <button
+            onClick={(e) => { e.stopPropagation(); onUnlink(); }}
+            title="Unlink"
+            className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded text-gray-300 hover:text-red-400 hover:bg-red-50"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12" /></svg>
+          </button>
+        </div>
+      </div>
+      <div className="grid grid-cols-3 gap-2 mb-4">
+        {[
+          { label: "Deploys", value: String(deploys.length) },
+          { label: "Success", value: successRate !== null ? `${successRate}%` : "—" },
+          { label: "Last", value: latest ? timeAgo(latest.created_at) : "—" },
+        ].map((stat) => (
+          <div key={stat.label} className="bg-gray-50 rounded-lg px-2.5 py-2 text-center">
+            <div className="text-[15px] font-bold text-gray-900">{stat.value}</div>
+            <div className="text-[9px] uppercase tracking-wider text-gray-400 mt-0.5">{stat.label}</div>
+          </div>
+        ))}
+      </div>
+      {latest && (
+        <div className="flex items-center gap-2 bg-gray-50 rounded-lg px-3 py-2">
+          <svg className="w-3 h-3 text-gray-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="3" /><line x1="3" y1="12" x2="9" y2="12" /><line x1="15" y1="12" x2="21" y2="12" />
+          </svg>
+          <span className="text-[11px] text-gray-500 truncate">{latest.commit_message ?? "No commit message"}</span>
+        </div>
+      )}
+      <div className="flex items-center justify-between mt-3">
+        <a
+          href={`https://dashboard.render.com/web/${service.resource_id}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          className="text-[11px] text-gray-300 hover:text-brand-purple transition-colors"
+        >
+          Open in Render ↗
+        </a>
+        <div className={`flex items-center gap-1 text-[11px] font-medium transition-all duration-200 ${selected ? "text-brand-purple" : "text-gray-300 group-hover:text-brand-purple/60"}`}>
+          <span>{selected ? "Hide details" : "View details"}</span>
+          <svg className={`w-3 h-3 transition-transform duration-300 ${selected ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+            <path d="M19 9l-7 7-7-7" />
+          </svg>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- Render deploy row ---
+export function RenderDeployRow({ deploy, index, serviceId, onViewLogs, onRedeploy }: {
+  deploy: RenderDeploy; index: number; serviceId: string;
+  onViewLogs: (url: string, subtitle: string) => void;
+  onRedeploy: (serviceId: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const color = RENDER_COLOR[deploy.status] ?? "#d1d5db";
+  const isBuilding = deploy.status === "build_in_progress" || deploy.status === "update_in_progress";
+
+  return (
+    <div className="animate-slide-up border-l-[3px] transition-all" style={{ borderLeftColor: color, animationDelay: `${index * 30}ms` }}>
+      <div onClick={() => setExpanded((e) => !e)} className="w-full flex items-center gap-3 px-5 py-3.5 hover:bg-gray-50 transition-colors cursor-pointer group">
+        <span className="relative flex items-center justify-center w-2.5 h-2.5 shrink-0">
+          {isBuilding && <span className="absolute inline-flex w-full h-full rounded-full opacity-75 animate-ping" style={{ background: color }} />}
+          <span className="relative inline-flex w-2.5 h-2.5 rounded-full" style={{ background: color }} />
+        </span>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-0.5">
+            <span className="text-[13px] font-medium text-gray-900 truncate">{deploy.commit_message ?? "No commit message"}</span>
+            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${RENDER_BG[deploy.status] ?? "text-gray-500 bg-gray-100"}`}>
+              {RENDER_LABEL[deploy.status] ?? deploy.status}
+            </span>
+          </div>
+          {deploy.commit_id && <div className="text-[11px] font-mono text-gray-400">{deploy.commit_id}</div>}
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <CopyButton text={deploy.id} />
+          <span className="text-[11px] text-gray-400">{timeAgo(deploy.created_at)}</span>
+          <svg className={`w-3.5 h-3.5 text-gray-300 transition-transform duration-200 ${expanded ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 9l-7 7-7-7" /></svg>
+        </div>
+      </div>
+      {expanded && (
+        <div className="px-5 pb-4 pt-2 border-t border-gray-100 bg-gray-50/60 animate-fade-in">
+          <div className="grid grid-cols-2 gap-x-8 gap-y-2.5 mb-4">
+            {[
+              { label: "Deploy ID", value: deploy.id, mono: true },
+              { label: "Status", value: RENDER_LABEL[deploy.status] ?? deploy.status },
+              { label: "Commit", value: deploy.commit_id ?? "—", mono: true },
+              { label: "Finished", value: deploy.finished_at ? timeAgo(deploy.finished_at) : "—" },
+            ].map((d) => (
+              <div key={d.label}>
+                <div className="text-[10px] text-gray-400 uppercase tracking-wider mb-0.5">{d.label}</div>
+                <div className={`text-[12px] text-gray-700 truncate ${d.mono ? "font-mono" : ""}`}>{d.value}</div>
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center gap-3">
+            <a
+              href={`https://dashboard.render.com/web/${serviceId}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[12px] font-medium px-3.5 py-1.5 rounded-button bg-gray-900 text-white hover:bg-gray-700 transition-colors"
+            >
+              Open deployment ↗
+            </a>
+            <button
+              onClick={() => onViewLogs(`/api/render/deploys/${serviceId}/${deploy.id}/logs`, deploy.commit_id ?? deploy.id)}
+              className="text-[12px] font-medium px-3.5 py-1.5 rounded-button border border-gray-200 text-gray-600 hover:border-brand-purple hover:text-brand-purple transition-colors flex items-center gap-1.5"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+              </svg>
+              View logs
+            </button>
+            <button
+              onClick={() => onRedeploy(serviceId)}
+              className="text-[12px] font-medium px-3.5 py-1.5 rounded-button border border-gray-200 text-gray-600 hover:border-brand-purple hover:text-brand-purple transition-colors"
+            >
+              Redeploy this
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

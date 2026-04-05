@@ -1,482 +1,160 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { apiFetch } from "@/lib/api";
-import { SiRender } from "react-icons/si";
+import { groupByDate, timeAgo } from "@/lib/utils";
+import type {
+  Project, ProjectService, Deployment, Commit, PullRequest,
+  RenderDeploy, VercelProject, GitHubRepo, RenderService,
+  SupabaseProject, SupabaseServiceHealth, SupabaseOverview,
+  DeployAnalysis, UptimeStatus, EnvVar, LogLine,
+} from "@/types/project";
+import { InsightPanel } from "@/components/project/InsightPanel";
+import { BuildTrendChart } from "@/components/project/BuildTrendChart";
+import { DORAMetrics } from "@/components/project/DORAMetrics";
+import { StatusDot, CopyButton, STATE_COLOR, STATE_LABEL, STATE_BG, RENDER_COLOR, RENDER_LABEL, RENDER_BG } from "@/components/project/StatusDot";
+import { DeploymentRow } from "@/components/project/DeploymentRow";
+import { VercelCard } from "@/components/project/VercelCard";
+import { RenderCard, RenderDeployRow } from "@/components/project/RenderCard";
+import { GitHubCard, CommitRow, PRRow } from "@/components/project/GitHubCard";
+import { SupabaseCard, SB_COLOR } from "@/components/project/SupabaseCard";
 
-interface ProjectService {
-  id: string;
-  service_type: string;
-  resource_id: string;
-  resource_name: string;
-}
-
-interface Project {
-  id: string;
-  name: string;
-  description: string;
-  project_services: ProjectService[];
-}
-
-interface VercelProject { id: string; name: string; }
-interface GitHubRepo { id: number; full_name: string; name: string; }
-interface RenderService { id: string; name: string; type: string; suspended: boolean; url: string | null; }
-
-interface RenderDeploy {
-  id: string; status: string; commit_message: string | null;
-  commit_id: string | null; created_at: string; finished_at: string | null;
-}
-
-interface Deployment {
-  id: string; name: string; url: string; state: string;
-  target: string; branch: string; commit_message: string; created_at: number;
-}
-
-interface Commit {
-  sha: string; message: string; author: string;
-  author_avatar: string | null; date: string; url: string;
-}
-
-interface PullRequest {
-  number: number; title: string; state: string; author: string;
-  author_avatar: string; branch: string; base: string;
-  created_at: string; updated_at: string; url: string;
-  draft: boolean; labels: string[];
-}
-
-const STATE_COLOR: Record<string, string> = {
-  READY: "#34d399", ERROR: "#f87171", BUILDING: "#fbbf24", CANCELED: "#d1d5db",
-};
-const STATE_LABEL: Record<string, string> = {
-  READY: "Ready", ERROR: "Failed", BUILDING: "Building", CANCELED: "Canceled",
-};
-const STATE_BG: Record<string, string> = {
-  READY: "text-emerald-600 bg-emerald-50",
-  ERROR: "text-red-500 bg-red-50",
-  BUILDING: "text-amber-500 bg-amber-50",
-  CANCELED: "text-gray-400 bg-gray-100",
-};
-
-// Render deploy status mappings
-const RENDER_COLOR: Record<string, string> = {
-  live: "#34d399", build_failed: "#f87171", build_in_progress: "#fbbf24",
-  update_in_progress: "#fbbf24", canceled: "#d1d5db", deactivated: "#d1d5db",
-  pre_deploy_in_progress: "#fbbf24",
-};
-const RENDER_LABEL: Record<string, string> = {
-  live: "Live", build_failed: "Failed", build_in_progress: "Building",
-  update_in_progress: "Updating", canceled: "Canceled", deactivated: "Deactivated",
-  pre_deploy_in_progress: "Pre-deploy",
-};
-const RENDER_BG: Record<string, string> = {
-  live: "text-emerald-600 bg-emerald-50",
-  build_failed: "text-red-500 bg-red-50",
-  build_in_progress: "text-amber-500 bg-amber-50",
-  update_in_progress: "text-amber-500 bg-amber-50",
-  canceled: "text-gray-400 bg-gray-100",
-  deactivated: "text-gray-400 bg-gray-100",
-  pre_deploy_in_progress: "text-amber-500 bg-amber-50",
-};
-
-function timeAgo(val: number | string): string {
-  const ms = typeof val === "number" ? val : new Date(val).getTime();
-  const diff = Date.now() - ms;
-  const mins = Math.floor(diff / 60000);
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  return `${Math.floor(hrs / 24)}d ago`;
-}
-
-function StatusDot({ state }: { state: string }) {
-  const color = STATE_COLOR[state] ?? "#d1d5db";
-  return (
-    <span className="relative flex items-center justify-center w-2.5 h-2.5 shrink-0">
-      {state === "BUILDING" && (
-        <span className="absolute inline-flex w-full h-full rounded-full opacity-75 animate-ping" style={{ background: color }} />
-      )}
-      <span className="relative inline-flex w-2.5 h-2.5 rounded-full" style={{ background: color }} />
-    </span>
-  );
-}
-
-// --- Copy button ---
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <button
-      onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
-      title="Copy"
-      className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-gray-500 shrink-0"
-    >
-      {copied
-        ? <svg className="w-3 h-3 text-emerald-400" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" /></svg>
-        : <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
-      }
-    </button>
-  );
-}
-
-// --- Render card ---
-function RenderCard({ service, deploys, selected, onClick, onUnlink }: {
-  service: ProjectService; deploys: RenderDeploy[]; selected: boolean; onClick: () => void; onUnlink: () => void;
+// --- Log drawer ---
+function LogDrawer({ logsUrl, title, subtitle, onClose }: {
+  logsUrl: string | null; title: string; subtitle: string; onClose: () => void;
 }) {
-  const latest = deploys[0];
-  const liveCount = deploys.filter((d) => d.status === "live").length;
-  const successRate = deploys.length ? Math.round((liveCount / deploys.length) * 100) : null;
-  const isBuilding = latest?.status === "build_in_progress" || latest?.status === "update_in_progress";
+  const [lines, setLines] = useState<LogLine[]>([]);
+  const [loading, setLoading] = useState(false);
+  const errorRef = useRef<HTMLDivElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!logsUrl) return;
+    setLines([]);
+    setLoading(true);
+    apiFetch(logsUrl)
+      .then((r) => r.json())
+      .then((d) => setLines(d.lines ?? []))
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, [logsUrl]);
+
+  // Auto-scroll to first error after load
+  useEffect(() => {
+    if (!loading && lines.length > 0) {
+      setTimeout(() => {
+        if (errorRef.current) {
+          errorRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+        } else {
+          containerRef.current?.scrollTo({ top: containerRef.current.scrollHeight, behavior: "smooth" });
+        }
+      }, 100);
+    }
+  }, [loading, lines]);
+
+  // Close on Escape
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onClose]);
+
+  if (!logsUrl) return null;
+
+  let firstErrorSet = false;
 
   return (
-    <div
-      onClick={onClick}
-      className={`group relative w-full cursor-pointer rounded-card p-5 shadow-card transition-all duration-300 overflow-hidden
-        ${selected
-          ? "bg-white border-2 border-brand-purple shadow-[0_0_0_4px_rgba(111,123,247,0.12)]"
-          : "bg-white/95 border border-white/60 hover:border-brand-purple/50 hover:shadow-xl hover:-translate-y-0.5"
-        }`}
-    >
-      {selected && <div className="absolute inset-0 bg-linear-to-br from-brand-purple/5 to-brand-cyan/5 pointer-events-none" />}
-      <div className="flex items-start justify-between mb-4">
-        <div className="flex items-center gap-2.5">
-          <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-white transition-all duration-300 ${selected ? "bg-linear-to-br from-brand-purple to-brand-cyan shadow-button" : "bg-[#46E3B7]"}`}>
-            <SiRender className="w-4 h-4" />
-          </div>
-          <div>
-            <div className="text-[14px] font-semibold text-gray-900">Render</div>
-            <div className="text-[11px] text-gray-400">{service.resource_name}</div>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {latest && (
-            <div className="flex items-center gap-1.5">
-              <span className="relative flex items-center justify-center w-2.5 h-2.5 shrink-0">
-                {isBuilding && <span className="absolute inline-flex w-full h-full rounded-full opacity-75 animate-ping" style={{ background: RENDER_COLOR[latest.status] }} />}
-                <span className="relative inline-flex w-2.5 h-2.5 rounded-full" style={{ background: RENDER_COLOR[latest.status] ?? "#d1d5db" }} />
-              </span>
-              <span className="text-[11px] font-medium" style={{ color: RENDER_COLOR[latest.status] ?? "#d1d5db" }}>{RENDER_LABEL[latest.status] ?? latest.status}</span>
+    <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
+      {/* Scrim */}
+      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+
+      {/* Drawer */}
+      <div
+        className="relative w-full max-w-2xl h-full bg-[#0d1117] flex flex-col shadow-2xl animate-slide-in-right"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-white/10 shrink-0">
+          <div className="flex items-center gap-3">
+            <div className="w-7 h-7 bg-white/10 rounded-lg flex items-center justify-center">
+              <svg className="w-3.5 h-3.5 text-white/60" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+              </svg>
             </div>
-          )}
-          <button
-            onClick={(e) => { e.stopPropagation(); onUnlink(); }}
-            title="Unlink"
-            className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded text-gray-300 hover:text-red-400 hover:bg-red-50"
-          >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12" /></svg>
-          </button>
-        </div>
-      </div>
-      <div className="grid grid-cols-3 gap-2 mb-4">
-        {[
-          { label: "Deploys", value: String(deploys.length) },
-          { label: "Success", value: successRate !== null ? `${successRate}%` : "—" },
-          { label: "Last", value: latest ? timeAgo(latest.created_at) : "—" },
-        ].map((stat) => (
-          <div key={stat.label} className="bg-gray-50 rounded-lg px-2.5 py-2 text-center">
-            <div className="text-[15px] font-bold text-gray-900">{stat.value}</div>
-            <div className="text-[9px] uppercase tracking-wider text-gray-400 mt-0.5">{stat.label}</div>
-          </div>
-        ))}
-      </div>
-      {latest && (
-        <div className="flex items-center gap-2 bg-gray-50 rounded-lg px-3 py-2">
-          <svg className="w-3 h-3 text-gray-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="3" /><line x1="3" y1="12" x2="9" y2="12" /><line x1="15" y1="12" x2="21" y2="12" />
-          </svg>
-          <span className="text-[11px] text-gray-500 truncate">{latest.commit_message ?? "No commit message"}</span>
-        </div>
-      )}
-      <div className={`flex items-center justify-center gap-1 mt-3 text-[11px] font-medium transition-all duration-200 ${selected ? "text-brand-purple" : "text-gray-300 group-hover:text-brand-purple/60"}`}>
-        <span>{selected ? "Hide details" : "View details"}</span>
-        <svg className={`w-3 h-3 transition-transform duration-300 ${selected ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-          <path d="M19 9l-7 7-7-7" />
-        </svg>
-      </div>
-    </div>
-  );
-}
-
-// --- Render deploy row ---
-function RenderDeployRow({ deploy, index }: { deploy: RenderDeploy; index: number }) {
-  const color = RENDER_COLOR[deploy.status] ?? "#d1d5db";
-  const isBuilding = deploy.status === "build_in_progress" || deploy.status === "update_in_progress";
-  return (
-    <div className="animate-slide-up flex items-center gap-3 px-5 py-3.5 border-b border-gray-100 last:border-0 border-l-[3px]" style={{ borderLeftColor: color, animationDelay: `${index * 30}ms` }}>
-      <span className="relative flex items-center justify-center w-2.5 h-2.5 shrink-0">
-        {isBuilding && <span className="absolute inline-flex w-full h-full rounded-full opacity-75 animate-ping" style={{ background: color }} />}
-        <span className="relative inline-flex w-2.5 h-2.5 rounded-full" style={{ background: color }} />
-      </span>
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 mb-0.5">
-          <span className="text-[13px] font-medium text-gray-900 truncate">{deploy.commit_message ?? "No commit message"}</span>
-          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${RENDER_BG[deploy.status] ?? "text-gray-500 bg-gray-100"}`}>
-            {RENDER_LABEL[deploy.status] ?? deploy.status}
-          </span>
-        </div>
-        {deploy.commit_id && <div className="text-[11px] font-mono text-gray-400">{deploy.commit_id}</div>}
-      </div>
-      <span className="text-[11px] text-gray-400 shrink-0">{timeAgo(deploy.created_at)}</span>
-    </div>
-  );
-}
-
-// --- Vercel card ---
-function VercelCard({ service, deployments, selected, onClick, onUnlink }: {
-  service: ProjectService; deployments: Deployment[]; selected: boolean; onClick: () => void; onUnlink: () => void;
-}) {
-  const latest = deployments[0];
-  const readyCount = deployments.filter((d) => d.state === "READY").length;
-  const successRate = deployments.length ? Math.round((readyCount / deployments.length) * 100) : null;
-
-  return (
-    <div
-      onClick={onClick}
-      className={`group relative w-full cursor-pointer rounded-card p-5 shadow-card transition-all duration-300 overflow-hidden
-        ${selected
-          ? "bg-white border-2 border-brand-purple shadow-[0_0_0_4px_rgba(111,123,247,0.12)]"
-          : "bg-white/95 border border-white/60 hover:border-brand-purple/50 hover:shadow-xl hover:-translate-y-0.5"
-        }`}
-    >
-      {selected && <div className="absolute inset-0 bg-linear-to-br from-brand-purple/5 to-brand-cyan/5 pointer-events-none" />}
-      <div className="flex items-start justify-between mb-4">
-        <div className="flex items-center gap-2.5">
-          <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-white transition-all duration-300 ${selected ? "bg-linear-to-br from-brand-purple to-brand-cyan shadow-button" : "bg-gray-900"}`}>
-            <svg viewBox="0 0 76 65" className="w-3.5 h-3.5" fill="currentColor"><path d="M37.5274 0L75.0548 65H0L37.5274 0Z" /></svg>
-          </div>
-          <div>
-            <div className="text-[14px] font-semibold text-gray-900">Vercel</div>
-            <div className="text-[11px] text-gray-400">{service.resource_name}</div>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {latest && (
-            <div className="flex items-center gap-1.5">
-              <StatusDot state={latest.state} />
-              <span className="text-[11px] font-medium" style={{ color: STATE_COLOR[latest.state] }}>{STATE_LABEL[latest.state]}</span>
+            <div>
+              <div className="text-[13px] font-semibold text-white/90">{title}</div>
+              <div className="text-[11px] text-white/40 font-mono">{subtitle}</div>
             </div>
-          )}
-          <button
-            onClick={(e) => { e.stopPropagation(); onUnlink(); }}
-            title="Unlink"
-            className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded text-gray-300 hover:text-red-400 hover:bg-red-50"
-          >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12" /></svg>
-          </button>
-        </div>
-      </div>
-      <div className="grid grid-cols-3 gap-2 mb-4">
-        {[
-          { label: "Deploys", value: String(deployments.length) },
-          { label: "Success", value: successRate !== null ? `${successRate}%` : "—" },
-          { label: "Last", value: latest ? timeAgo(latest.created_at) : "—" },
-        ].map((stat) => (
-          <div key={stat.label} className="bg-gray-50 rounded-lg px-2.5 py-2 text-center">
-            <div className="text-[15px] font-bold text-gray-900">{stat.value}</div>
-            <div className="text-[9px] uppercase tracking-wider text-gray-400 mt-0.5">{stat.label}</div>
-          </div>
-        ))}
-      </div>
-      {latest && (
-        <div className="flex items-center gap-2 bg-gray-50 rounded-lg px-3 py-2">
-          <svg className="w-3 h-3 text-gray-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="3" /><line x1="3" y1="12" x2="9" y2="12" /><line x1="15" y1="12" x2="21" y2="12" />
-          </svg>
-          <span className="text-[11px] text-gray-500 truncate">{latest.commit_message ?? "No commit message"}</span>
-        </div>
-      )}
-      <div className={`flex items-center justify-center gap-1 mt-3 text-[11px] font-medium transition-all duration-200 ${selected ? "text-brand-purple" : "text-gray-300 group-hover:text-brand-purple/60"}`}>
-        <span>{selected ? "Hide details" : "View details"}</span>
-        <svg className={`w-3 h-3 transition-transform duration-300 ${selected ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-          <path d="M19 9l-7 7-7-7" />
-        </svg>
-      </div>
-    </div>
-  );
-}
-
-// --- GitHub card ---
-function GitHubCard({ service, commits, pulls, selected, onClick, onUnlink }: {
-  service: ProjectService; commits: Commit[]; pulls: PullRequest[]; selected: boolean; onClick: () => void; onUnlink: () => void;
-}) {
-  const latestCommit = commits[0];
-  const openPRs = pulls.filter((p) => p.state === "open").length;
-
-  return (
-    <div
-      onClick={onClick}
-      className={`group relative w-full cursor-pointer rounded-card p-5 shadow-card transition-all duration-300 overflow-hidden
-        ${selected
-          ? "bg-white border-2 border-brand-purple shadow-[0_0_0_4px_rgba(111,123,247,0.12)]"
-          : "bg-white/95 border border-white/60 hover:border-brand-purple/50 hover:shadow-xl hover:-translate-y-0.5"
-        }`}
-    >
-      {selected && <div className="absolute inset-0 bg-linear-to-br from-brand-purple/5 to-brand-cyan/5 pointer-events-none" />}
-      <div className="flex items-start justify-between mb-4">
-        <div className="flex items-center gap-2.5">
-          <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-white transition-all duration-300 ${selected ? "bg-linear-to-br from-brand-purple to-brand-cyan shadow-button" : "bg-gray-900"}`}>
-            <svg viewBox="0 0 24 24" className="w-4 h-4" fill="currentColor">
-              <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" />
-            </svg>
-          </div>
-          <div>
-            <div className="text-[14px] font-semibold text-gray-900">GitHub</div>
-            <div className="text-[11px] text-gray-400">{service.resource_name}</div>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {openPRs > 0 && (
-            <span className="text-[10px] font-semibold text-violet-600 bg-violet-50 px-1.5 py-0.5 rounded-full">
-              {openPRs} open PR{openPRs !== 1 ? "s" : ""}
-            </span>
-          )}
-          <button
-            onClick={(e) => { e.stopPropagation(); onUnlink(); }}
-            title="Unlink"
-            className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded text-gray-300 hover:text-red-400 hover:bg-red-50"
-          >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12" /></svg>
-          </button>
-        </div>
-      </div>
-      <div className="grid grid-cols-3 gap-2 mb-4">
-        {[
-          { label: "Commits", value: String(commits.length) },
-          { label: "Open PRs", value: String(openPRs) },
-          { label: "Last push", value: latestCommit ? timeAgo(latestCommit.date) : "—" },
-        ].map((stat) => (
-          <div key={stat.label} className="bg-gray-50 rounded-lg px-2.5 py-2 text-center">
-            <div className="text-[15px] font-bold text-gray-900">{stat.value}</div>
-            <div className="text-[9px] uppercase tracking-wider text-gray-400 mt-0.5">{stat.label}</div>
-          </div>
-        ))}
-      </div>
-      {latestCommit && (
-        <div className="flex items-center gap-2 bg-gray-50 rounded-lg px-3 py-2">
-          <svg className="w-3 h-3 text-gray-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="3" /><line x1="3" y1="12" x2="9" y2="12" /><line x1="15" y1="12" x2="21" y2="12" />
-          </svg>
-          <span className="text-[11px] text-gray-500 truncate">{latestCommit.message}</span>
-        </div>
-      )}
-      <div className="flex items-center justify-between mt-3">
-        <a
-          href={`https://dashboard.render.com/web/${service.resource_id}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e) => e.stopPropagation()}
-          className="text-[11px] text-gray-300 hover:text-brand-purple transition-colors"
-        >
-          Open in Render ↗
-        </a>
-        <div className={`flex items-center gap-1 text-[11px] font-medium transition-all duration-200 ${selected ? "text-brand-purple" : "text-gray-300 group-hover:text-brand-purple/60"}`}>
-          <span>{selected ? "Hide details" : "View details"}</span>
-          <svg className={`w-3 h-3 transition-transform duration-300 ${selected ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-            <path d="M19 9l-7 7-7-7" />
-          </svg>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// --- Deployment row ---
-function DeploymentRow({ deployment, index, onRedeploy }: { deployment: Deployment; index: number; onRedeploy: (id: string) => void }) {
-  const [expanded, setExpanded] = useState(false);
-  return (
-    <div className="animate-slide-up border-l-[3px] transition-all" style={{ borderLeftColor: STATE_COLOR[deployment.state] ?? "#d1d5db", animationDelay: `${index * 30}ms` }}>
-      <div onClick={() => setExpanded((e) => !e)} className="w-full flex items-center gap-3 px-5 py-3.5 hover:bg-gray-50 transition-colors cursor-pointer group">
-        <StatusDot state={deployment.state} />
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-0.5">
-            <span className="text-[13px] font-medium text-gray-900 truncate">{deployment.commit_message ?? deployment.name}</span>
-            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${STATE_BG[deployment.state] ?? "text-gray-500 bg-gray-100"}`}>
-              {STATE_LABEL[deployment.state] ?? deployment.state}
-            </span>
-          </div>
-          <div className="text-[11px] text-gray-400">{deployment.branch ?? "—"}</div>
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          <CopyButton text={deployment.id} />
-          <span className="text-[11px] text-gray-400">{deployment.created_at ? timeAgo(deployment.created_at) : "—"}</span>
-          {deployment.url && (
-            <a href={`https://${deployment.url}`} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()} className="text-[11px] text-brand-purple opacity-0 group-hover:opacity-100 transition-opacity hover:underline">Visit ↗</a>
-          )}
-          <svg className={`w-3.5 h-3.5 text-gray-300 transition-transform duration-200 ${expanded ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 9l-7 7-7-7" /></svg>
-        </div>
-      </div>
-      {expanded && (
-        <div className="px-5 pb-4 pt-2 border-t border-gray-100 bg-gray-50/60 animate-fade-in">
-          <div className="grid grid-cols-2 gap-x-8 gap-y-2.5 mb-4">
-            {[
-              { label: "Deployment ID", value: deployment.id, mono: true },
-              { label: "Target", value: deployment.target ?? "—" },
-              { label: "Branch", value: deployment.branch ?? "—" },
-              { label: "Created", value: deployment.created_at ? new Date(deployment.created_at).toLocaleString() : "—" },
-            ].map((d) => (
-              <div key={d.label}>
-                <div className="text-[10px] text-gray-400 uppercase tracking-wider mb-0.5">{d.label}</div>
-                <div className={`text-[12px] text-gray-700 truncate ${d.mono ? "font-mono" : ""}`}>{d.value}</div>
-              </div>
-            ))}
           </div>
           <div className="flex items-center gap-3">
-            {deployment.url && (
-              <a href={`https://${deployment.url}`} target="_blank" rel="noopener noreferrer" className="text-[12px] font-medium px-3.5 py-1.5 rounded-button bg-gray-900 text-white hover:bg-gray-700 transition-colors">
-                Open deployment ↗
-              </a>
-            )}
+            <span className="text-[11px] text-white/30"></span>
             <button
-              onClick={() => onRedeploy(deployment.id)}
-              className="text-[12px] font-medium px-3.5 py-1.5 rounded-button border border-gray-200 text-gray-600 hover:border-brand-purple hover:text-brand-purple transition-colors"
+              onClick={onClose}
+              className="w-7 h-7 rounded-lg bg-white/5 hover:bg-white/10 flex items-center justify-center text-white/50 hover:text-white/90 transition-colors"
             >
-              Redeploy this
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M18 6L6 18M6 6l12 12" />
+              </svg>
             </button>
           </div>
         </div>
-      )}
-    </div>
-  );
-}
 
-// --- Commit row ---
-function CommitRow({ commit, index }: { commit: Commit; index: number }) {
-  return (
-    <div className="animate-slide-up flex items-center gap-3 px-5 py-3 border-b border-gray-100 last:border-0 group" style={{ animationDelay: `${index * 30}ms` }}>
-      {commit.author_avatar ? (
-        <img src={commit.author_avatar} alt={commit.author} className="w-5 h-5 rounded-full shrink-0" />
-      ) : (
-        <div className="w-5 h-5 rounded-full bg-gray-200 shrink-0" />
-      )}
-      <div className="flex-1 min-w-0">
-        <div className="text-[13px] font-medium text-gray-900 truncate">{commit.message}</div>
-        <div className="text-[11px] text-gray-400">{commit.author}</div>
-      </div>
-      <div className="flex items-center gap-2 shrink-0">
-        <span className="text-[11px] font-mono text-gray-300">{commit.sha}</span>
-        <CopyButton text={commit.sha} />
-        <span className="text-[11px] text-gray-400">{timeAgo(commit.date)}</span>
-        <a href={commit.url} target="_blank" rel="noopener noreferrer" className="text-[11px] text-brand-purple opacity-0 group-hover:opacity-100 transition-opacity hover:underline">View ↗</a>
-      </div>
-    </div>
-  );
-}
-
-// --- PR row ---
-function PRRow({ pr, index }: { pr: PullRequest; index: number }) {
-  return (
-    <div className="animate-slide-up flex items-center gap-3 px-5 py-3 border-b border-gray-100 last:border-0 group" style={{ animationDelay: `${index * 30}ms` }}>
-      <img src={pr.author_avatar} alt={pr.author} className="w-5 h-5 rounded-full shrink-0" />
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 mb-0.5">
-          <span className="text-[13px] font-medium text-gray-900 truncate">{pr.title}</span>
-          {pr.draft && <span className="text-[10px] text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded-full shrink-0">Draft</span>}
+        {/* Log body */}
+        <div ref={containerRef} className="flex-1 overflow-y-auto px-5 py-4 font-mono text-[12px] leading-relaxed">
+          {loading ? (
+            <div className="flex items-center gap-2 text-white/40">
+              <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+              </svg>
+              Fetching logs…
+            </div>
+          ) : lines.length === 0 ? (
+            <span className="text-white/30">No log output available for this deployment.</span>
+          ) : (
+            lines.map((line, i) => {
+              const isError = line.type === "stderr";
+              const isCmd = line.type === "command";
+              const ref = isError && !firstErrorSet ? (firstErrorSet = true, true) : false;
+              return (
+                <div
+                  key={i}
+                  ref={ref ? (el) => { errorRef.current = el; } : undefined}
+                  className={`flex gap-3 py-0.5 ${isError ? "bg-red-950/40 -mx-5 px-5 rounded" : ""}`}
+                >
+                  <span className="text-white/20 select-none w-8 text-right shrink-0">{i + 1}</span>
+                  <span className={
+                    isError ? "text-red-400" :
+                    isCmd ? "text-emerald-400" :
+                    "text-white/75"
+                  }>
+                    {isCmd && <span className="text-white/30 mr-1">$</span>}
+                    {line.text}
+                  </span>
+                </div>
+              );
+            })
+          )}
         </div>
-        <div className="text-[11px] text-gray-400">{pr.branch} → {pr.base}</div>
-      </div>
-      <div className="flex items-center gap-2.5 shrink-0">
-        <span className="text-[11px] text-gray-400">#{pr.number}</span>
-        <span className="text-[11px] text-gray-400">{timeAgo(pr.updated_at)}</span>
-        <a href={pr.url} target="_blank" rel="noopener noreferrer" className="text-[11px] text-brand-purple opacity-0 group-hover:opacity-100 transition-opacity hover:underline">View ↗</a>
+
+        {/* Footer */}
+        {!loading && lines.length > 0 && (
+          <div className="px-5 py-3 border-t border-white/10 flex items-center justify-between shrink-0">
+            <div className="flex items-center gap-4 text-[11px] text-white/30">
+              <span>{lines.length} lines</span>
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-sm bg-red-400/60" />
+                stderr
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-sm bg-emerald-400/60" />
+                command
+              </span>
+            </div>
+            <span className="text-[11px] text-white/20">ESC to close</span>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -495,13 +173,27 @@ export default function ProjectPage() {
   const [vercelProjects, setVercelProjects] = useState<VercelProject[]>([]);
   const [githubRepos, setGithubRepos] = useState<GitHubRepo[]>([]);
   const [renderServices, setRenderServices] = useState<RenderService[]>([]);
+  const [supabaseProjects, setSupabaseProjects] = useState<SupabaseProject[]>([]);
+  const [supabaseHealth, setSupabaseHealth] = useState<SupabaseServiceHealth[]>([]);
+  const [supabaseOverview, setSupabaseOverview] = useState<SupabaseOverview | null>(null);
+  const [supabaseTab, setSupabaseTab] = useState<"overview" | "logs" | "history">("overview");
   const [loading, setLoading] = useState(true);
   const [selectedService, setSelectedService] = useState<string | null>(null);
   const [showLinkPanel, setShowLinkPanel] = useState(false);
-  const [linkTab, setLinkTab] = useState<"vercel" | "github" | "render">("vercel");
+  const [linkTab, setLinkTab] = useState<"vercel" | "github" | "render" | "supabase">("vercel");
   const [githubTab, setGithubTab] = useState<"commits" | "prs">("commits");
   const [linking, setLinking] = useState(false);
   const [deploying, setDeploying] = useState(false);
+  const [insightRefreshKey, setInsightRefreshKey] = useState(0);
+  const [logDrawer, setLogDrawer] = useState<{ logsUrl: string; title: string; subtitle: string } | null>(null);
+  const [vercelFilter, setVercelFilter] = useState<"all" | "production" | "failures" | "preview">("all");
+  const [vercelDetailTab, setVercelDetailTab] = useState<"deployments" | "env">("deployments");
+  const [uptimeData, setUptimeData] = useState<Record<string, UptimeStatus>>({});
+  const [envVars, setEnvVars] = useState<EnvVar[]>([]);
+  const [envVarsLoaded, setEnvVarsLoaded] = useState(false);
+  const [proactiveAlerts, setProactiveAlerts] = useState<Record<string, DeployAnalysis>>({});
+  const prevVercelStates = useRef<Record<string, string>>({});
+  const prevRenderStates = useRef<Record<string, string>>({});
 
   useEffect(() => {
     apiFetch(`/api/projects/${id}`)
@@ -514,7 +206,8 @@ export default function ProjectPage() {
         const vercelSvc = p.project_services.find((s) => s.service_type === "vercel");
         const githubSvc = p.project_services.find((s) => s.service_type === "github");
         const renderSvc = p.project_services.find((s) => s.service_type === "render");
-        const first = vercelSvc ?? githubSvc ?? renderSvc;
+        const supabaseSvc = p.project_services.find((s) => s.service_type === "supabase");
+        const first = vercelSvc ?? githubSvc ?? renderSvc ?? supabaseSvc;
         if (first) setSelectedService(first.id);
 
         const fetches: Promise<void>[] = [];
@@ -538,13 +231,21 @@ export default function ProjectPage() {
               .then((r) => r.json()).then((d) => setRenderDeploys(d.deploys ?? [])).catch(() => {})
           );
         }
+        if (supabaseSvc) {
+          fetches.push(
+            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/health`)
+              .then((r) => r.json()).then((d) => setSupabaseHealth(d.services ?? [])).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/overview`)
+              .then((r) => r.json()).then((d) => setSupabaseOverview(d)).catch(() => {})
+          );
+        }
         return Promise.all(fetches);
       })
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [id]);
 
-  // Auto-poll when a deploy is in-progress
+  // Auto-poll when a deploy is in-progress; trigger insight refresh when build settles
   useEffect(() => {
     const buildingVercel = deployments.some((d) => d.state === "BUILDING");
     const buildingRender = renderDeploys.some((d) => ["build_in_progress", "update_in_progress", "pre_deploy_in_progress"].includes(d.status));
@@ -554,23 +255,103 @@ export default function ProjectPage() {
       if (buildingVercel) {
         const svc = project?.project_services.find((s) => s.service_type === "vercel");
         if (svc) apiFetch(`/api/vercel/deployments?limit=20&projectId=${svc.resource_id}`)
-          .then((r) => r.json()).then((d) => setDeployments(d.deployments ?? [])).catch(() => {});
+          .then((r) => r.json())
+          .then((d) => {
+            const newDeploys = d.deployments ?? [];
+            // Proactive failure analysis — auto-run when a build goes BUILDING → ERROR
+            for (const dep of newDeploys as { id: string; state: string }[]) {
+              if (prevVercelStates.current[dep.id] === "BUILDING" && dep.state === "ERROR") {
+                apiFetch(`/api/insights/deployment/${dep.id}`, { method: "POST" })
+                  .then((r) => r.json())
+                  .then((analysis) => setProactiveAlerts((prev) => ({ ...prev, [dep.id]: analysis })))
+                  .catch(() => {});
+              }
+            }
+            const settled = newDeploys.some(
+              (dep: { id: string; state: string }) =>
+                prevVercelStates.current[dep.id] === "BUILDING" &&
+                (dep.state === "READY" || dep.state === "ERROR")
+            );
+            prevVercelStates.current = Object.fromEntries(newDeploys.map((dep: { id: string; state: string }) => [dep.id, dep.state]));
+            setDeployments(newDeploys);
+            if (settled) setInsightRefreshKey((k) => k + 1);
+          })
+          .catch(() => {});
       }
       if (buildingRender) {
         const svc = project?.project_services.find((s) => s.service_type === "render");
         if (svc) apiFetch(`/api/render/deploys?serviceId=${svc.resource_id}&limit=20`)
-          .then((r) => r.json()).then((d) => setRenderDeploys(d.deploys ?? [])).catch(() => {});
+          .then((r) => r.json())
+          .then((d) => {
+            const newDeploys = d.deploys ?? [];
+            const settledStatuses = ["live", "build_failed", "canceled", "deactivated"];
+            const settled = newDeploys.some(
+              (dep: { id: string; status: string }) =>
+                ["build_in_progress", "update_in_progress", "pre_deploy_in_progress"].includes(prevRenderStates.current[dep.id]) &&
+                settledStatuses.includes(dep.status)
+            );
+            prevRenderStates.current = Object.fromEntries(newDeploys.map((dep: { id: string; status: string }) => [dep.id, dep.status]));
+            setRenderDeploys(newDeploys);
+            if (settled) setInsightRefreshKey((k) => k + 1);
+          })
+          .catch(() => {});
       }
     }, 15000);
 
     return () => clearInterval(interval);
   }, [deployments, renderDeploys, project]);
 
+  // Uptime checks — fire once when we have deployment URLs to ping
+  useEffect(() => {
+    if (!project) return;
+    const runCheck = async (serviceType: string, serviceId: string, url: string) => {
+      const key = `${serviceType}:${serviceId}`;
+      try {
+        const checkRes = await apiFetch("/api/uptime/check", {
+          method: "POST",
+          body: JSON.stringify({ url, service_type: serviceType, service_id: serviceId }),
+        });
+        const check = await checkRes.json();
+        setUptimeData((prev) => ({ ...prev, [key]: { ...check, uptime_pct: null, avg_latency_ms: null, checks: [] } }));
+        const histRes = await apiFetch(`/api/uptime/history?service_type=${serviceType}&service_id=${serviceId}`);
+        const hist = await histRes.json();
+        setUptimeData((prev) => ({ ...prev, [key]: { ...prev[key], ...hist } }));
+      } catch { /* silent */ }
+    };
+
+    const vercelSvc = project.project_services.find((s) => s.service_type === "vercel");
+    if (vercelSvc && deployments[0]?.url) {
+      runCheck("vercel", vercelSvc.resource_id, `https://${deployments[0].url}`);
+    }
+    const renderSvc = project.project_services.find((s) => s.service_type === "render");
+    if (renderSvc) {
+      apiFetch(`/api/render/services`)
+        .then((r) => r.json())
+        .then((d) => {
+          const svc = (d.services ?? []).find((s: { id: string; url: string | null }) => s.id === renderSvc.resource_id);
+          if (svc?.url) runCheck("render", renderSvc.resource_id, svc.url);
+        })
+        .catch(() => {});
+    }
+  }, [project, deployments.length > 0 ? deployments[0]?.url : null]);
+
+  // Env vars — lazy-load when user switches to the env tab
+  useEffect(() => {
+    if (vercelDetailTab !== "env") return;
+    const vercelSvc = project?.project_services.find((s) => s.service_type === "vercel");
+    if (!vercelSvc || envVarsLoaded) return;
+    apiFetch(`/api/vercel/projects/${vercelSvc.resource_id}/env`)
+      .then((r) => r.json())
+      .then((d) => { setEnvVars(d.envs ?? []); setEnvVarsLoaded(true); })
+      .catch(() => setEnvVarsLoaded(true));
+  }, [vercelDetailTab, project]);
+
   const openLinkPanel = () => {
     setShowLinkPanel(true);
     apiFetch("/api/vercel/projects").then((r) => r.json()).then((d) => setVercelProjects(d.projects ?? [])).catch(() => {});
     apiFetch("/api/github/repos").then((r) => r.json()).then((d) => setGithubRepos(d.repos ?? [])).catch(() => {});
     apiFetch("/api/render/services").then((r) => r.json()).then((d) => setRenderServices(d.services ?? [])).catch(() => {});
+    apiFetch("/api/supabase/projects").then((r) => r.json()).then((d) => setSupabaseProjects(d.projects ?? [])).catch(() => {});
   };
 
   const handleLink = async (serviceType: string, resourceId: string, resourceName: string) => {
@@ -593,6 +374,11 @@ export default function ProjectPage() {
           ]);
         } else if (serviceType === "render") {
           await apiFetch(`/api/render/deploys?serviceId=${resourceId}&limit=20`).then((r) => r.json()).then((d) => setRenderDeploys(d.deploys ?? [])).catch(() => {});
+        } else if (serviceType === "supabase") {
+          await Promise.all([
+            apiFetch(`/api/supabase/projects/${resourceId}/health`).then((r) => r.json()).then((d) => setSupabaseHealth(d.services ?? [])).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${resourceId}/overview`).then((r) => r.json()).then((d) => setSupabaseOverview(d)).catch(() => {}),
+          ]);
         } else {
           await apiFetch(`/api/vercel/deployments?limit=20&projectId=${resourceId}`).then((r) => r.json()).then((d) => setDeployments(d.deployments ?? [])).catch(() => {});
         }
@@ -638,6 +424,7 @@ export default function ProjectPage() {
     if (serviceType === "vercel") setDeployments([]);
     if (serviceType === "github") { setCommits([]); setPulls([]); }
     if (serviceType === "render") setRenderDeploys([]);
+    if (serviceType === "supabase") { setSupabaseHealth([]); setSupabaseOverview(null); }
   };
 
   const handleDelete = async () => {
@@ -680,6 +467,9 @@ export default function ProjectPage() {
         </div>
       </div>
 
+      {/* AI Insight */}
+      {project.project_services.length > 0 && <InsightPanel projectId={project.id} refreshKey={insightRefreshKey} />}
+
       {/* Service cards */}
       {project.project_services.length === 0 ? (
         <div className="bg-white/95 border border-white/60 rounded-card p-12 shadow-card text-center animate-fade-in">
@@ -696,13 +486,16 @@ export default function ProjectPage() {
         <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-3.5 mb-6">
           {project.project_services.map((svc) => {
             if (svc.service_type === "vercel") {
-              return <VercelCard key={svc.id} service={svc} deployments={deployments} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
+              return <VercelCard key={svc.id} service={svc} deployments={deployments} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} uptime={uptimeData[`vercel:${svc.resource_id}`]} />;
             }
             if (svc.service_type === "github") {
               return <GitHubCard key={svc.id} service={svc} commits={commits} pulls={pulls} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
             }
             if (svc.service_type === "render") {
               return <RenderCard key={svc.id} service={svc} deploys={renderDeploys} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
+            }
+            if (svc.service_type === "supabase") {
+              return <SupabaseCard key={svc.id} service={svc} health={supabaseHealth} overview={supabaseOverview} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
             }
             return null;
           })}
@@ -726,11 +519,33 @@ export default function ProjectPage() {
                     </button>
                   ))}
                 </div>
+              ) : activeService.service_type === "supabase" ? (
+                <div className="flex gap-1 bg-white/20 rounded-button p-0.5">
+                  {(["overview", "logs", "history"] as const).map((tab) => (
+                    <button
+                      key={tab}
+                      onClick={() => setSupabaseTab(tab)}
+                      className={`text-[11px] font-medium px-3 py-1 rounded-button transition-all capitalize ${supabaseTab === tab ? "bg-white text-gray-900 shadow-sm" : "text-white/60 hover:text-white"}`}
+                    >
+                      {tab === "logs" ? `Errors` : tab === "history" ? "Actions" : "Overview"}
+                    </button>
+                  ))}
+                </div>
+              ) : activeService.service_type === "vercel" ? (
+                <div className="flex gap-1 bg-white/20 rounded-button p-0.5">
+                  {(["deployments", "env"] as const).map((tab) => (
+                    <button
+                      key={tab}
+                      onClick={() => setVercelDetailTab(tab)}
+                      className={`text-[11px] font-medium px-3 py-1 rounded-button transition-all capitalize ${vercelDetailTab === tab ? "bg-white text-gray-900 shadow-sm" : "text-white/60 hover:text-white"}`}
+                    >
+                      {tab === "env" ? "Env Vars" : "Deployments"}
+                    </button>
+                  ))}
+                </div>
               ) : (
                 <div>
-                  <h2 className="text-xs font-semibold text-white/80 uppercase tracking-wider">
-                    {activeService.service_type === "render" ? "Deploys" : "Deployments"}
-                  </h2>
+                  <h2 className="text-xs font-semibold text-white/80 uppercase tracking-wider">Deploys</h2>
                   <p className="text-[11px] text-white/40 mt-0.5">{activeService.resource_name}</p>
                 </div>
               )}
@@ -766,21 +581,216 @@ export default function ProjectPage() {
             </div>
           </div>
 
+          {/* Stats strip for Vercel */}
+          {activeService.service_type === "vercel" && deployments.length > 0 && (() => {
+            const week = deployments.filter(d => Date.now() - d.created_at < 7 * 86400000).length;
+            const ready = deployments.filter(d => d.state === "READY").length;
+            const rate = Math.round(ready / deployments.length * 100);
+            const withDur = deployments.filter(d => d.build_duration != null);
+            const avg = withDur.length ? Math.round(withDur.reduce((s, d) => s + d.build_duration!, 0) / withDur.length) : null;
+            let streak = 0;
+            for (const d of deployments) { if (d.state === "READY") streak++; else break; }
+            const chips = [
+              { label: "This week", value: String(week) },
+              { label: "Success rate", value: `${rate}%`, color: rate >= 80 ? "text-emerald-600" : rate >= 50 ? "text-amber-600" : "text-red-500" },
+              { label: "Avg build", value: avg != null ? `${avg}s` : "—" },
+              { label: "Streak", value: streak > 0 ? `${streak} ✓` : "—", color: streak >= 3 ? "text-emerald-600" : undefined },
+            ];
+            return (
+              <div className="flex items-center gap-2 mb-2.5">
+                {chips.map((c) => (
+                  <div key={c.label} className="flex items-center gap-1.5 bg-white/60 border border-white/60 rounded-lg px-3 py-1.5 shadow-sm">
+                    <span className={`text-[13px] font-semibold ${c.color ?? "text-gray-800"}`}>{c.value}</span>
+                    <span className="text-[10px] text-gray-400">{c.label}</span>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+
+          {/* Stats strip for Render */}
+          {activeService.service_type === "render" && renderDeploys.length > 0 && (() => {
+            const week = renderDeploys.filter(d => Date.now() - new Date(d.created_at).getTime() < 7 * 86400000).length;
+            const live = renderDeploys.filter(d => d.status === "live").length;
+            const rate = Math.round(live / renderDeploys.length * 100);
+            const withDur = renderDeploys.filter(d => d.finished_at);
+            const avg = withDur.length ? Math.round(withDur.reduce((s, d) => s + (new Date(d.finished_at!).getTime() - new Date(d.created_at).getTime()) / 1000, 0) / withDur.length) : null;
+            let streak = 0;
+            for (const d of renderDeploys) { if (d.status === "live") streak++; else break; }
+            const chips = [
+              { label: "This week", value: String(week) },
+              { label: "Success rate", value: `${rate}%`, color: rate >= 80 ? "text-emerald-600" : rate >= 50 ? "text-amber-600" : "text-red-500" },
+              { label: "Avg build", value: avg != null ? `${avg}s` : "—" },
+              { label: "Streak", value: streak > 0 ? `${streak} ✓` : "—", color: streak >= 3 ? "text-emerald-600" : undefined },
+            ];
+            return (
+              <div className="flex items-center gap-2 mb-2.5">
+                {chips.map((c) => (
+                  <div key={c.label} className="flex items-center gap-1.5 bg-white/60 border border-white/60 rounded-lg px-3 py-1.5 shadow-sm">
+                    <span className={`text-[13px] font-semibold ${c.color ?? "text-gray-800"}`}>{c.value}</span>
+                    <span className="text-[10px] text-gray-400">{c.label}</span>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+
           <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100">
-            {activeService.service_type === "vercel" && (
-              deployments.length === 0
-                ? <p className="text-sm text-gray-400 text-center py-12">No deployments found</p>
-                : deployments.map((d, i) => <DeploymentRow key={d.id} deployment={d} index={i} onRedeploy={async (depId) => {
-                    setDeploying(true);
-                    try {
-                      const res = await apiFetch("/api/vercel/redeploy", { method: "POST", body: JSON.stringify({ deploymentId: depId }) });
-                      if (res.ok) {
-                        const nd = await res.json();
-                        setDeployments((prev) => [{ ...d, id: nd.id, state: "BUILDING", created_at: Date.now() }, ...prev]);
-                      }
-                    } finally { setDeploying(false); }
-                  }} />)
-            )}
+            {activeService.service_type === "vercel" && (() => {
+              const githubSvc = project.project_services.find(s => s.service_type === "github");
+              const vercelUptime = uptimeData[`vercel:${activeService.resource_id}`];
+
+              // --- Env vars tab ---
+              if (vercelDetailTab === "env") {
+                return (
+                  <>
+                    <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
+                      <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Environment Variables</p>
+                      <p className="text-[11px] text-gray-400 mt-0.5">Values are redacted — names only</p>
+                    </div>
+                    {!envVarsLoaded && envVars.length === 0 ? (
+                      <div className="px-5 py-8 text-[12px] text-gray-400 text-center">Loading…</div>
+                    ) : envVars.length === 0 ? (
+                      <div className="px-5 py-8 text-[12px] text-gray-400 text-center">No environment variables found</div>
+                    ) : (
+                      envVars.map((v) => (
+                        <div key={v.key} className="flex items-center justify-between px-5 py-2.5 border-b border-gray-100 last:border-0 hover:bg-gray-50/40 transition-colors group">
+                          <div className="flex items-center gap-3 min-w-0">
+                            <span className="text-[12px] font-mono font-medium text-gray-800 truncate">{v.key}</span>
+                            <span className="text-[10px] font-mono text-gray-300 shrink-0">••••••••</span>
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0 ml-4">
+                            {(Array.isArray(v.target) ? v.target : [v.target]).map((t: string) => (
+                              <span key={t} className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full uppercase tracking-wider ${
+                                t === "production" ? "text-emerald-600 bg-emerald-50" :
+                                t === "preview" ? "text-blue-500 bg-blue-50" :
+                                "text-gray-500 bg-gray-100"
+                              }`}>{t}</span>
+                            ))}
+                            {v.git_branch && (
+                              <span className="text-[9px] font-mono text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded-full">{v.git_branch}</span>
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </>
+                );
+              }
+
+              // --- Deployments tab ---
+              const filtered = deployments.filter(d => {
+                if (vercelFilter === "production") return d.target === "production";
+                if (vercelFilter === "preview") return d.target !== "production";
+                if (vercelFilter === "failures") return d.state === "ERROR";
+                return true;
+              });
+              const maxBuildDuration = Math.max(...filtered.map(d => d.build_duration ?? 0), 1);
+              const groups = groupByDate(filtered);
+              const FILTERS = [
+                { key: "all",        label: "All" },
+                { key: "production", label: "Production" },
+                { key: "preview",    label: "Preview" },
+                { key: "failures",   label: "Failures", count: deployments.filter(d => d.state === "ERROR").length },
+              ] as const;
+
+              return (
+                <>
+                  <BuildTrendChart items={deployments.filter(d => d.build_duration != null).slice(0, 12).reverse().map(d => ({
+                    label: d.commit_sha?.slice(0, 5) ?? "—",
+                    duration: d.build_duration!,
+                    status: d.state,
+                    commit: d.commit_message ?? "",
+                    ts: d.created_at,
+                  }))} />
+                  <DORAMetrics deployments={deployments} />
+
+                  {/* Uptime history strip */}
+                  {vercelUptime && vercelUptime.checks.length > 0 && (
+                    <div className="px-5 py-3 border-b border-gray-100">
+                      <div className="flex items-center justify-between mb-1.5">
+                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Uptime</p>
+                        <div className="flex items-center gap-3 text-[10px] text-gray-400">
+                          {vercelUptime.uptime_pct != null && <span className="font-medium text-gray-600">{vercelUptime.uptime_pct}%</span>}
+                          {vercelUptime.avg_latency_ms != null && <span>{vercelUptime.avg_latency_ms}ms avg</span>}
+                        </div>
+                      </div>
+                      <div className="flex gap-0.5">
+                        {vercelUptime.checks.map((c, i) => (
+                          <div key={i} title={`${c.is_up ? "Up" : "Down"} — ${new Date(c.checked_at).toLocaleString()}`}
+                            className={`flex-1 h-5 rounded-sm ${c.is_up ? "bg-emerald-400/70" : "bg-red-400/80"}`} />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Proactive failure alerts */}
+                  {Object.entries(proactiveAlerts).map(([depId, alert]) => (
+                    <div key={depId} className="mx-5 mt-3 rounded-lg border border-red-200 bg-red-50/60 px-4 py-3 animate-slide-up">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-start gap-2">
+                          <svg className="w-3.5 h-3.5 text-red-500 mt-0.5 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                            <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+                          </svg>
+                          <div>
+                            <p className="text-[11px] font-semibold text-red-700 mb-0.5">Build failed — {alert.reason}</p>
+                            {alert.fix && <p className="text-[11px] text-gray-600">{alert.fix}</p>}
+                          </div>
+                        </div>
+                        <button onClick={() => setProactiveAlerts((prev) => { const n = { ...prev }; delete n[depId]; return n; })}
+                          className="text-[10px] text-gray-400 hover:text-gray-600 shrink-0 transition-colors">✕</button>
+                      </div>
+                    </div>
+                  ))}
+
+                  {/* Filter bar */}
+                  <div className="flex items-center gap-1 px-5 py-2.5 border-b border-gray-100">
+                    {FILTERS.map(f => (
+                      <button
+                        key={f.key}
+                        onClick={() => setVercelFilter(f.key)}
+                        className={`text-[11px] font-medium px-2.5 py-1 rounded-button transition-all ${
+                          vercelFilter === f.key ? "bg-gray-900 text-white" : "text-gray-400 hover:text-gray-600 hover:bg-gray-100"
+                        }`}
+                      >
+                        {"count" in f && f.count > 0 ? `${f.label} (${f.count})` : f.label}
+                      </button>
+                    ))}
+                  </div>
+                  {filtered.length === 0
+                    ? <p className="text-sm text-gray-400 text-center py-12">No deployments match this filter</p>
+                    : groups.map((group) => (
+                        <div key={group.label}>
+                          <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
+                            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{group.label}</span>
+                          </div>
+                          {group.items.map((d, i) => (
+                            <DeploymentRow
+                              key={d.id}
+                              deployment={d}
+                              index={i}
+                              maxBuildDuration={maxBuildDuration}
+                              githubRepo={githubSvc?.resource_id}
+                              initialAnalysis={proactiveAlerts[d.id]}
+                              onViewLogs={(depId, name) => setLogDrawer({ logsUrl: `/api/vercel/deployments/${depId}/logs`, title: "Build Logs", subtitle: name })}
+                              onRedeploy={async (depId) => {
+                                setDeploying(true);
+                                try {
+                                  const res = await apiFetch("/api/vercel/redeploy", { method: "POST", body: JSON.stringify({ deploymentId: depId }) });
+                                  if (res.ok) {
+                                    const nd = await res.json();
+                                    setDeployments((prev) => [{ ...d, id: nd.id, state: "BUILDING", created_at: Date.now() }, ...prev]);
+                                  }
+                                } finally { setDeploying(false); }
+                              }}
+                            />
+                          ))}
+                        </div>
+                      ))
+                  }
+                </>
+              );
+            })()}
             {activeService.service_type === "github" && githubTab === "commits" && (
               commits.length === 0
                 ? <p className="text-sm text-gray-400 text-center py-12">No commits found</p>
@@ -791,14 +801,159 @@ export default function ProjectPage() {
                 ? <p className="text-sm text-gray-400 text-center py-12">No pull requests found</p>
                 : pulls.map((p, i) => <PRRow key={p.number} pr={p} index={i} />)
             )}
-            {activeService.service_type === "render" && (
-              renderDeploys.length === 0
-                ? <p className="text-sm text-gray-400 text-center py-12">No deploys found</p>
-                : renderDeploys.map((d, i) => <RenderDeployRow key={d.id} deploy={d} index={i} />)
+            {activeService.service_type === "render" && (() => {
+              const groups = groupByDate(renderDeploys);
+              return (
+                <>
+                  <BuildTrendChart items={renderDeploys.filter(d => d.finished_at).slice(0, 12).reverse().map(d => ({
+                    label: d.commit_id?.slice(0, 5) ?? "—",
+                    duration: Math.round((new Date(d.finished_at!).getTime() - new Date(d.created_at).getTime()) / 1000),
+                    status: d.status,
+                    commit: d.commit_message ?? "",
+                    ts: new Date(d.created_at).getTime(),
+                  }))} />
+                  {renderDeploys.length === 0
+                    ? <p className="text-sm text-gray-400 text-center py-12">No deploys found</p>
+                    : groups.map((group) => (
+                        <div key={group.label}>
+                          <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
+                            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{group.label}</span>
+                          </div>
+                          {group.items.map((d, i) => (
+                            <RenderDeployRow
+                              key={d.id}
+                              deploy={d}
+                              index={i}
+                              serviceId={activeService.resource_id}
+                              onViewLogs={(url, subtitle) => setLogDrawer({ logsUrl: url, title: "Deploy Logs", subtitle })}
+                              onRedeploy={async (svcId) => {
+                                setDeploying(true);
+                                try {
+                                  const res = await apiFetch("/api/render/deploy", { method: "POST", body: JSON.stringify({ serviceId: svcId }) });
+                                  if (res.ok) { const nd = await res.json(); setRenderDeploys((prev) => [{ ...d, id: nd.id, status: "build_in_progress", created_at: nd.created_at }, ...prev]); }
+                                } finally { setDeploying(false); }
+                              }}
+                            />
+                          ))}
+                        </div>
+                      ))
+                  }
+              </>
+              );
+            })()}
+            {activeService.service_type === "supabase" && supabaseTab === "overview" && (
+              <>
+                {/* Service health */}
+                <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
+                  <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Services</p>
+                  <div className="flex flex-wrap gap-3">
+                    {supabaseHealth.length === 0
+                      ? <p className="text-[12px] text-gray-400">Loading…</p>
+                      : supabaseHealth.map((s) => (
+                          <div key={s.name} className="flex items-center gap-1.5">
+                            <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: SB_COLOR[s.status] ?? "#d1d5db" }} />
+                            <span className="text-[12px] text-gray-600 capitalize">{s.name.replace(/_/g, " ")}</span>
+                          </div>
+                        ))
+                    }
+                  </div>
+                </div>
+                {/* API request volume */}
+                {supabaseOverview?.available.api_stats === false ? (
+                  <div className="px-5 py-4 text-[12px] text-gray-400">API stats not available for this plan</div>
+                ) : !supabaseOverview ? (
+                  <div className="px-5 py-4 text-[12px] text-gray-400">Loading…</div>
+                ) : supabaseOverview.api_stats.length === 0 ? (
+                  <div className="px-5 py-4 text-[12px] text-gray-400">No API traffic data yet</div>
+                ) : (
+                  <>
+                    <div className="px-5 pt-3 pb-1">
+                      <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">API Requests — Last 7 Days</p>
+                      <div className="flex items-end gap-1 h-16">
+                        {(() => {
+                          const max = Math.max(...supabaseOverview.api_stats.map((p) => p.count), 1);
+                          return supabaseOverview.api_stats.slice(-7).map((point, i) => (
+                            <div key={i} className="flex-1 flex flex-col items-center gap-1 group relative">
+                              <div
+                                className="w-full rounded-sm bg-brand-purple/40 hover:bg-brand-purple/70 transition-colors"
+                                style={{ height: `${Math.max(4, (point.count / max) * 56)}px` }}
+                              />
+                              <span className="text-[9px] text-gray-400 tabular-nums">
+                                {point.count >= 1000 ? `${(point.count / 1000).toFixed(1)}k` : point.count}
+                              </span>
+                              <div suppressHydrationWarning className="absolute -top-6 left-1/2 -translate-x-1/2 bg-gray-800 text-white text-[10px] px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
+                                {new Date(point.timestamp).toLocaleDateString("en-US", { month: "short", day: "numeric" })}: {point.count.toLocaleString()}
+                              </div>
+                            </div>
+                          ));
+                        })()}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+            {activeService.service_type === "supabase" && supabaseTab === "logs" && (
+              !supabaseOverview ? (
+                <p className="text-sm text-gray-400 text-center py-12">Loading…</p>
+              ) : supabaseOverview.available.logs === false ? (
+                <p className="text-sm text-gray-400 text-center py-12">Log access not available for this plan</p>
+              ) : supabaseOverview.error_logs.length === 0 ? (
+                <div className="flex flex-col items-center py-12 gap-2">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                  <p className="text-sm text-gray-400">No errors in the last 24h</p>
+                </div>
+              ) : supabaseOverview.error_logs.map((log, i) => (
+                <div key={i} className="px-5 py-3 border-b border-gray-100 last:border-0 hover:bg-gray-50/40 transition-colors">
+                  <div className="flex items-center gap-2 mb-1">
+                    {log.status && (
+                      <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${log.status >= 500 ? "text-red-600 bg-red-50" : "text-amber-600 bg-amber-50"}`}>
+                        {log.status}
+                      </span>
+                    )}
+                    <span suppressHydrationWarning className="text-[11px] text-gray-400 shrink-0">
+                      {new Date(log.timestamp).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}
+                    </span>
+                  </div>
+                  <p className="text-[12px] text-gray-700 font-mono truncate">{log.message || "—"}</p>
+                </div>
+              ))
+            )}
+            {activeService.service_type === "supabase" && supabaseTab === "history" && (
+              !supabaseOverview ? (
+                <p className="text-sm text-gray-400 text-center py-12">Loading…</p>
+              ) : supabaseOverview.available.actions === false ? (
+                <p className="text-sm text-gray-400 text-center py-12">Action history not available</p>
+              ) : supabaseOverview.actions.length === 0 ? (
+                <p className="text-sm text-gray-400 text-center py-12">No actions found</p>
+              ) : supabaseOverview.actions.map((action) => (
+                <div key={action.id} className="flex items-center justify-between px-5 py-3.5 border-b border-gray-100 last:border-0">
+                  <div className="flex items-center gap-2.5">
+                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
+                      action.status === "COMPLETED" ? "text-emerald-600 bg-emerald-50" :
+                      action.status === "FAILED" ? "text-red-500 bg-red-50" :
+                      action.status === "IN_PROGRESS" ? "text-amber-500 bg-amber-50" :
+                      "text-gray-500 bg-gray-100"
+                    }`}>{action.status}</span>
+                    {action.error_message && (
+                      <span className="text-[12px] text-gray-500 truncate max-w-50">{action.error_message}</span>
+                    )}
+                  </div>
+                  <span suppressHydrationWarning className="text-[11px] text-gray-400 shrink-0">{timeAgo(new Date(action.created_at).getTime())}</span>
+                </div>
+              ))
             )}
           </div>
         </div>
       )}
+
+      {/* Log drawer */}
+      <LogDrawer
+        logsUrl={logDrawer?.logsUrl ?? null}
+        title={logDrawer?.title ?? ""}
+        subtitle={logDrawer?.subtitle ?? ""}
+        onClose={() => setLogDrawer(null)}
+      />
 
       {/* Link panel modal */}
       {showLinkPanel && (
@@ -809,13 +964,13 @@ export default function ProjectPage() {
 
             {/* Tabs */}
             <div className="flex gap-1 bg-gray-100 rounded-button p-0.5 mb-4">
-              {(["vercel", "github", "render"] as const).map((tab) => (
+              {(["vercel", "github", "render", "supabase"] as const).map((tab) => (
                 <button
                   key={tab}
                   onClick={() => setLinkTab(tab)}
                   className={`flex-1 text-[12px] font-medium py-1.5 rounded-button transition-all capitalize ${linkTab === tab ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"}`}
                 >
-                  {tab === "vercel" ? "Vercel" : tab === "github" ? "GitHub" : "Render"}
+                  {tab === "vercel" ? "Vercel" : tab === "github" ? "GitHub" : tab === "render" ? "Render" : "Supabase"}
                 </button>
               ))}
             </div>
@@ -860,6 +1015,22 @@ export default function ProjectPage() {
                         <button key={r.id} onClick={() => handleLink("render", r.id, r.name)} disabled={linking} className="w-full text-left px-4 py-3 rounded-button border border-gray-200 hover:border-brand-purple hover:bg-brand-purple/5 transition-all disabled:opacity-50">
                           <div className="text-[13px] text-gray-800 font-medium">{r.name}</div>
                           <div className="text-[11px] text-gray-400 mt-0.5">{r.type.replace("_", " ")} {r.suspended ? "· suspended" : ""}</div>
+                        </button>
+                      ))
+                }
+              </div>
+            )}
+
+            {linkTab === "supabase" && (
+              <div className="space-y-1.5 max-h-60 overflow-y-auto">
+                {supabaseProjects.filter((p) => !project.project_services.some((s) => s.resource_id === p.ref)).length === 0
+                  ? <p className="text-sm text-gray-400 text-center py-6">No Supabase projects available</p>
+                  : supabaseProjects
+                      .filter((p) => !project.project_services.some((s) => s.resource_id === p.ref))
+                      .map((p) => (
+                        <button key={p.ref} onClick={() => handleLink("supabase", p.ref, p.name)} disabled={linking} className="w-full text-left px-4 py-3 rounded-button border border-gray-200 hover:border-brand-purple hover:bg-brand-purple/5 transition-all disabled:opacity-50">
+                          <div className="text-[13px] text-gray-800 font-medium">{p.name}</div>
+                          <div className="text-[11px] text-gray-400 mt-0.5">{p.region} · {p.status === "ACTIVE_HEALTHY" ? "Healthy" : p.status}</div>
                         </button>
                       ))
                 }

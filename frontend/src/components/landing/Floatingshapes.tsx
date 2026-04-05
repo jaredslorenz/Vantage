@@ -29,7 +29,7 @@ export function FloatingShapes() {
         }}
       >
         <div className="text-7xl font-semibold bg-gradient-to-br from-[#6f7bf7] to-[#c6f8ff] bg-clip-text text-transparent">
-          94%
+          3.2e4
         </div>
       </div>
 

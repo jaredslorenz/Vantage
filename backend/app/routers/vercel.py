@@ -1,4 +1,5 @@
 import hashlib
+import re
 import secrets
 import httpx
 from base64 import urlsafe_b64encode
@@ -10,6 +11,40 @@ from app.core.config import settings
 from app.core.encryption import encrypt_token, decrypt_token
 from app.core.security import get_user_id
 from app.core.supabase import supabase
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text).strip()
+
+
+async def fetch_deployment_logs(deployment_id: str, token: str, client: httpx.AsyncClient) -> list[str]:
+    """
+    Fetch build log lines for a Vercel deployment.
+    Returns up to 60 cleaned lines focused on errors and build output.
+    """
+    resp = await client.get(
+        f"{VERCEL_API}/v2/deployments/{deployment_id}/events",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"direction": "backward", "limit": 100},
+    )
+    if resp.status_code != 200:
+        return []
+
+    events = resp.json() if isinstance(resp.json(), list) else []
+
+    lines = []
+    for event in reversed(events):  # backward direction returns newest first
+        text = _strip_ansi(event.get("text", ""))
+        if not text:
+            continue
+        event_type = event.get("type", "")
+        # Include stderr always, stdout for commands and non-empty output
+        if event_type in ("stderr", "command") or (event_type == "stdout" and text):
+            lines.append(f"[{event_type}] {text}")
+
+    # Return last 60 lines — enough context without bloating the prompt
+    return lines[-60:]
 
 VERCEL_API = "https://api.vercel.com"
 
@@ -274,6 +309,67 @@ async def get_vercel_projects(user_id: str = Depends(get_user_id)):
     return {"projects": projects}
 
 
+@router.get("/deployments/{deployment_id}/logs")
+async def get_deployment_logs(deployment_id: str, user_id: str = Depends(get_user_id)):
+    """Fetch structured build log lines for a Vercel deployment."""
+    token = _get_vercel_token(user_id)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{VERCEL_API}/v2/deployments/{deployment_id}/events",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"direction": "backward", "limit": 200},
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Failed to fetch deployment logs")
+
+    body = resp.json()
+    raw_events = body if isinstance(body, list) else body.get("events", body.get("data", []))
+    if not isinstance(raw_events, list):
+        raw_events = []
+
+    # direction=backward returns newest first — reverse for chronological order
+    lines = []
+    for event in reversed(raw_events):
+        text = _strip_ansi(event.get("text", "")).strip()
+        if not text:
+            continue
+        event_type = event.get("type", "stdout")
+        if event_type in ("stderr", "command", "stdout"):
+            lines.append({"type": event_type, "text": text})
+
+    return {"lines": lines, "deployment_id": deployment_id}
+
+
+@router.get("/projects/{project_id}/env")
+async def get_env_vars(project_id: str, user_id: str = Depends(get_user_id)):
+    """Fetch environment variable names (values redacted) for a Vercel project."""
+    token = _get_vercel_token(user_id)
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{VERCEL_API}/v9/projects/{project_id}/env",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Failed to fetch env vars from Vercel")
+
+    envs = resp.json().get("envs", [])
+    return {
+        "envs": [
+            {
+                "key": e["key"],
+                "target": e.get("target", []),
+                "type": e.get("type", "encrypted"),
+                "git_branch": e.get("gitBranch"),
+            }
+            for e in envs
+        ]
+    }
+
+
 @router.get("/deployments")
 async def get_vercel_deployments(
     user_id: str = Depends(get_user_id),
@@ -313,6 +409,12 @@ async def get_vercel_deployments(
     for d in sorted(all_deployments, key=lambda x: x.get("createdAt", 0), reverse=True):
         if d["uid"] not in seen:
             seen.add(d["uid"])
+            building_at = d.get("buildingAt")
+            ready_at = d.get("ready")
+            build_duration = None
+            if building_at and ready_at:
+                build_duration = round((ready_at - building_at) / 1000)  # seconds
+
             deployments.append({
                 "id": d["uid"],
                 "name": d.get("name"),
@@ -321,7 +423,11 @@ async def get_vercel_deployments(
                 "target": d.get("target"),
                 "branch": d.get("meta", {}).get("githubCommitRef"),
                 "commit_message": d.get("meta", {}).get("githubCommitMessage"),
+                "commit_sha": d.get("meta", {}).get("githubCommitSha", "")[:7],
+                "pr_id": d.get("meta", {}).get("githubPrId"),
                 "created_at": d.get("createdAt"),
+                "ready_at": ready_at,
+                "build_duration": build_duration,
             })
 
     return {"deployments": deployments[:limit]}

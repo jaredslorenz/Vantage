@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Vantage",
+  title: "Vantage - DevOps Hub",
   description: "All your DevOps in one platform",
 };
 
@@ -35,9 +35,7 @@ export default async function RootLayout({
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">
-        <AuthProvider initialUser={user}>
-          {children}
-        </AuthProvider>
+        <AuthProvider initialUser={user}>{children}</AuthProvider>
       </body>
     </html>
   );

@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.routers import health, vercel, services, projects, github, render
+from app.routers import health, vercel, services, projects, github, render, insights, supabase_mgmt, events, uptime
 
 app = FastAPI(title="Vantage API", version="0.1.0")
 
@@ -19,3 +19,7 @@ app.include_router(services.router)
 app.include_router(projects.router)
 app.include_router(github.router)
 app.include_router(render.router)
+app.include_router(insights.router)
+app.include_router(supabase_mgmt.router)
+app.include_router(events.router)
+app.include_router(uptime.router)

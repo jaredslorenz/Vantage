@@ -102,6 +102,56 @@ async def get_services(user_id: str = Depends(get_user_id)):
     return {"services": services}
 
 
+@router.get("/deploys/{service_id}/{deploy_id}/logs")
+async def get_deploy_logs(service_id: str, deploy_id: str, user_id: str = Depends(get_user_id)):
+    """Fetch log lines for a Render deploy using the unified logs endpoint."""
+    token = _get_render_token(user_id)
+
+    # First fetch the deploy to get its time window
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        deploy_resp = await client.get(
+            f"{RENDER_API}/services/{service_id}/deploys/{deploy_id}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+        if deploy_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to fetch deploy details from Render")
+
+        deploy = deploy_resp.json().get("deploy", deploy_resp.json())
+        start = deploy.get("createdAt")
+        end = deploy.get("finishedAt")
+
+        params: dict = {"resource": service_id, "limit": 200}
+        if start:
+            params["startTime"] = start
+        if end:
+            params["endTime"] = end
+
+        logs_resp = await client.get(
+            "https://api.render.com/v1/logs",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            params=params,
+        )
+
+    if logs_resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Render logs API returned {logs_resp.status_code}: {logs_resp.text[:200]}",
+        )
+
+    raw = logs_resp.json()
+    entries = raw.get("logs", raw) if isinstance(raw, dict) else raw
+
+    lines = []
+    for entry in (entries if isinstance(entries, list) else []):
+        text = (entry.get("message") or entry.get("text") or "").strip()
+        if not text:
+            continue
+        line_type = "stderr" if any(kw in text.lower() for kw in ("error", "err ", "failed", "exception", "fatal", "panic", "traceback")) else "stdout"
+        lines.append({"type": line_type, "text": text})
+
+    return {"lines": lines}
+
+
 class TriggerDeployRequest(BaseModel):
     serviceId: str
     clearCache: bool = False
@@ -141,7 +191,7 @@ async def get_deploys(
     """Fetch recent deploys for a Render service."""
     token = _get_render_token(user_id)
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)) as client:
         resp = await client.get(
             f"{RENDER_API}/services/{serviceId}/deploys",
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
