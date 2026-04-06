@@ -523,7 +523,10 @@ export default function ProjectPage() {
           </button>
         </div>
       ) : (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-3.5 mb-6">
+        <div
+          className="grid gap-3.5 mb-6"
+          style={{ gridTemplateColumns: `repeat(${Math.min(project.project_services.length, 4)}, minmax(0, 1fr))` }}
+        >
           {project.project_services.map((svc) => {
             if (svc.service_type === "vercel") {
               return <VercelCard key={svc.id} service={svc} deployments={deployments} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} uptime={uptimeData[`vercel:${svc.resource_id}`]} onInvestigate={() => setSelectedService(svc.id)} />;

@@ -18,10 +18,7 @@ export default function DashboardLayout({
     <div className="min-h-screen bg-gradient-brand flex relative overflow-hidden">
       <MorphingBackground />
       <Sidebar collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} />
-      <div
-        className="flex flex-col min-w-0 transition-all duration-300"
-        style={{ width: `calc(100% - ${collapsed ? "5rem" : "13.75rem"})` }}
-      >
+      <div className="flex flex-col flex-1 min-w-0 transition-all duration-300">
         <Header user={user} />
         <main className="flex-1 overflow-auto p-6">{children}</main>
       </div>

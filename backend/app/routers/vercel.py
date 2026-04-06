@@ -99,7 +99,7 @@ async def connect_vercel(user_id: str = Depends(get_user_id)):
     params = urlencode({
         "client_id": settings.vercel_client_id,
         "response_type": "code",
-        "redirect_uri": "http://localhost:8000/api/vercel/callback",
+        "redirect_uri": f"{settings.backend_url}/api/vercel/callback",
         "state": state,
         "nonce": nonce,
         "code_challenge": code_challenge,
@@ -147,7 +147,7 @@ async def vercel_callback(
                 "client_secret": settings.vercel_client_secret,
                 "code": code,
                 "code_verifier": code_verifier,
-                "redirect_uri": "http://localhost:8000/api/vercel/callback",
+                "redirect_uri": f"{settings.backend_url}/api/vercel/callback",
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )

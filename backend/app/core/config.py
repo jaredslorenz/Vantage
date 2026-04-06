@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     # CORS
     frontend_url: str = "http://localhost:3000"
 
+    # Public backend URL (used for OAuth redirect URIs)
+    backend_url: str = "http://localhost:8000"
+
     # Vercel
     vercel_client_id: str = ""
     vercel_client_secret: str = ""

@@ -3,11 +3,13 @@ import hashlib
 import json
 from datetime import datetime
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from openai import AsyncOpenAI
 from app.core.config import settings
 from app.core.security import get_user_id
 from app.core.supabase import supabase
+from app.core.limiter import limiter
+from app.core.logger import logger
 from app.routers.vercel import _get_vercel_token, fetch_deployment_logs
 from app.routers.render import _get_render_token
 from app.routers.github import _get_github_token
@@ -338,7 +340,8 @@ async def get_insight(project_id: str, user_id: str = Depends(get_user_id)):
 
 
 @router.post("/{project_id}/generate")
-async def generate_insight(project_id: str, user_id: str = Depends(get_user_id), force: bool = False):
+@limiter.limit("10/minute")
+async def generate_insight(request: Request, project_id: str, user_id: str = Depends(get_user_id), force: bool = False):
     """Generate an AI insight for a project, using cache if data hasn't changed."""
     if not settings.openai_api_key:
         raise HTTPException(status_code=503, detail="AI insights not configured")
