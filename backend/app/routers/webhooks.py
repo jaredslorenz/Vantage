@@ -62,9 +62,9 @@ async def vercel_webhook(request: Request):
     )
 
     # Find which user + project owns this Vercel project
-    # Match via project_services where service_type=vercel and resource_id=vercel project id
+    # Join with projects to get user_id (project_services has no user_id column)
     svc_result = supabase.table("project_services") \
-        .select("project_id, user_id") \
+        .select("project_id, projects(user_id)") \
         .eq("service_type", "vercel") \
         .eq("resource_id", project_id_vercel) \
         .execute()
@@ -72,7 +72,7 @@ async def vercel_webhook(request: Request):
     if not svc_result.data:
         # Try matching by resource_name (project name) as fallback
         svc_result = supabase.table("project_services") \
-            .select("project_id, user_id") \
+            .select("project_id, projects(user_id)") \
             .eq("service_type", "vercel") \
             .eq("resource_name", deployment_name) \
             .execute()
@@ -119,7 +119,7 @@ async def vercel_webhook(request: Request):
     rows = []
     for svc in svc_result.data:
         rows.append({
-            "user_id": svc["user_id"],
+            "user_id": (svc.get("projects") or {}).get("user_id"),
             "project_id": svc["project_id"],
             "service_type": "vercel",
             "event_type": event_type,

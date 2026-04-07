@@ -22,6 +22,22 @@ GITHUB_API = "https://api.github.com"
 
 scheduler = AsyncIOScheduler()
 
+# ── Simple TTL cache ────────────────────────────────────────────────────────
+
+_cache: dict[str, tuple[float, object]] = {}
+_CACHE_TTL = 300  # 5 minutes
+
+
+def _cache_get(key: str):
+    entry = _cache.get(key)
+    if entry and (datetime.now(timezone.utc).timestamp() - entry[0]) < _CACHE_TTL:
+        return entry[1]
+    return None
+
+
+def _cache_set(key: str, value: object) -> None:
+    _cache[key] = (datetime.now(timezone.utc).timestamp(), value)
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -34,27 +50,52 @@ def _ms_to_iso(ms: int | float) -> str:
 
 
 def _get_connected_users(service_type: str) -> list[dict]:
-    """Return all active connections for a service type."""
-    result = supabase.table("connected_services") \
-        .select("user_id, api_token") \
-        .eq("service_type", service_type) \
-        .eq("is_active", True) \
-        .execute()
-    return result.data or []
+    """Return all active connections for a service type (cached 5 min)."""
+    key = f"connected_users:{service_type}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached  # type: ignore
+    try:
+        result = supabase.table("connected_services") \
+            .select("user_id, api_token") \
+            .eq("service_type", service_type) \
+            .eq("is_active", True) \
+            .execute()
+        data = result.data or []
+        _cache_set(key, data)
+        return data
+    except Exception as exc:
+        logger.error("_get_connected_users failed service=%s: %s", service_type, exc)
+        return []
 
 
 def _get_project_map(user_id: str, service_type: str) -> dict[str, str]:
-    """Return {resource_id: project_id} for a user's linked services."""
-    projects = supabase.table("projects").select("id").eq("user_id", user_id).execute()
+    """Return {resource_id: project_id} for a user's linked services (cached 5 min)."""
+    key = f"project_map:{user_id}:{service_type}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached  # type: ignore
+    try:
+        projects = supabase.table("projects").select("id").eq("user_id", user_id).execute()
+    except Exception as exc:
+        logger.error("_get_project_map projects query failed: %s", exc)
+        return {}
     project_ids = [p["id"] for p in (projects.data or [])]
     if not project_ids:
+        _cache_set(key, {})
         return {}
-    result = supabase.table("project_services") \
-        .select("resource_id, project_id") \
-        .in_("project_id", project_ids) \
-        .eq("service_type", service_type) \
-        .execute()
-    return {row["resource_id"]: row["project_id"] for row in (result.data or [])}
+    try:
+        result = supabase.table("project_services") \
+            .select("resource_id, project_id") \
+            .in_("project_id", project_ids) \
+            .eq("service_type", service_type) \
+            .execute()
+    except Exception as exc:
+        logger.error("_get_project_map project_services query failed: %s", exc)
+        return {}
+    mapping = {row["resource_id"]: row["project_id"] for row in (result.data or [])}
+    _cache_set(key, mapping)
+    return mapping
 
 
 def _upsert_events(rows: list[dict]) -> None:
@@ -714,13 +755,13 @@ def cleanup_uptime_checks() -> None:
 # ── Scheduler setup ────────────────────────────────────────────────────────
 
 def start_scheduler() -> None:
-    scheduler.add_job(poll_vercel, "interval", seconds=60, id="poll_vercel", max_instances=1)
-    scheduler.add_job(poll_render, "interval", seconds=30, id="poll_render", max_instances=1)
-    scheduler.add_job(poll_github, "interval", minutes=2, id="poll_github", max_instances=1)
-    scheduler.add_job(poll_render_metrics, "interval", minutes=5, id="render_metrics", max_instances=1)
-    scheduler.add_job(scan_render_logs, "interval", seconds=60, id="scan_render_logs", max_instances=1)
-    scheduler.add_job(check_render_service_health, "interval", minutes=2, id="render_health", max_instances=1)
-    scheduler.add_job(check_endpoints, "interval", minutes=5, id="check_endpoints", max_instances=1)
+    scheduler.add_job(poll_vercel, "interval", minutes=2, id="poll_vercel", max_instances=1)
+    scheduler.add_job(poll_render, "interval", minutes=2, id="poll_render", max_instances=1)
+    scheduler.add_job(poll_github, "interval", minutes=5, id="poll_github", max_instances=1)
+    scheduler.add_job(poll_render_metrics, "interval", minutes=10, id="render_metrics", max_instances=1)
+    scheduler.add_job(scan_render_logs, "interval", minutes=2, id="scan_render_logs", max_instances=1)
+    scheduler.add_job(check_render_service_health, "interval", minutes=10, id="render_health", max_instances=1)
+    scheduler.add_job(check_endpoints, "interval", minutes=10, id="check_endpoints", max_instances=1)
     scheduler.add_job(cleanup_uptime_checks, "interval", hours=6, id="cleanup_uptime", max_instances=1)
     scheduler.start()
     logger.info("Scheduler started")
