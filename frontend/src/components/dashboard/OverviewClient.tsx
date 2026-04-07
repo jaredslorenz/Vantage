@@ -5,6 +5,7 @@ import Link from "next/link";
 import { SiRender, SiSupabase } from "react-icons/si";
 import { useAuth } from "@/contexts/AuthContext";
 import { apiFetch } from "@/lib/api";
+import { createClient } from "@/lib/supabase/client";
 
 interface ConnectedService {
   service_type: string;
@@ -196,6 +197,24 @@ export default function OverviewClient() {
       })
       .catch(() => {})
       .finally(() => setLoading(false));
+
+    // Realtime — refresh Vercel deployments when new events land
+    const supabase = createClient();
+    const channel = supabase
+      .channel("overview-events")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "events", filter: "service_type=eq.vercel" },
+        () => {
+          apiFetch("/api/vercel/deployments?limit=5")
+            .then((r) => r.json())
+            .then((d) => setDeployments(d.deployments ?? []))
+            .catch(() => {});
+        }
+      )
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
   }, []);
 
   return (

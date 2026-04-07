@@ -67,44 +67,9 @@ class ConnectRequest(BaseModel):
     token: str
 
 
-async def _register_vercel_webhook(token: str, webhook_url: str) -> str | None:
-    """Register a Vercel webhook and return the webhook ID, or None on failure."""
-    from app.core.config import settings as _settings
-    if not _settings.vercel_webhook_secret:
-        return None
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{VERCEL_API}/v1/webhooks",
-            headers={"Authorization": f"Bearer {token}"},
-            json={
-                "url": webhook_url,
-                "events": [
-                    "deployment.created",
-                    "deployment.succeeded",
-                    "deployment.ready",
-                    "deployment.error",
-                    "deployment.canceled",
-                ],
-            },
-        )
-    if resp.status_code in (200, 201):
-        return resp.json().get("id")
-    return None
-
-
-async def _delete_vercel_webhook(token: str, webhook_id: str) -> None:
-    """Delete a Vercel webhook by ID."""
-    async with httpx.AsyncClient() as client:
-        await client.delete(
-            f"{VERCEL_API}/v1/webhooks/{webhook_id}",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-
-
 @router.post("/connect")
 async def connect_vercel(body: ConnectRequest, user_id: str = Depends(get_user_id)):
     """Validate a Vercel Personal Access Token and store it."""
-    from app.core.config import settings as _settings
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"{VERCEL_API}/v2/user",
@@ -116,15 +81,9 @@ async def connect_vercel(body: ConnectRequest, user_id: str = Depends(get_user_i
 
     user_data = resp.json().get("user", resp.json())
     vercel_user_id = user_data.get("id", "")
-    # Prefer defaultTeamSlug (used in dashboard URLs), fall back to username
     vercel_username = user_data.get("defaultTeamSlug") or user_data.get("username") or user_data.get("name") or "Vercel"
 
-    # Register webhook so we get real-time deployment events
-    webhook_id = None
-    webhook_url = f"{_settings.backend_url}/api/webhooks/vercel"
-    webhook_id = await _register_vercel_webhook(body.token, webhook_url)
-
-    row: dict = {
+    supabase.table("connected_services").upsert({
         "user_id": user_id,
         "service_type": "vercel",
         "service_id": vercel_user_id,
@@ -132,11 +91,7 @@ async def connect_vercel(body: ConnectRequest, user_id: str = Depends(get_user_i
         "api_token": encrypt_token(body.token),
         "is_active": True,
         "health_status": "healthy",
-    }
-    if webhook_id:
-        row["webhook_id"] = webhook_id
-
-    supabase.table("connected_services").upsert(row, on_conflict="user_id,service_type,service_id").execute()
+    }, on_conflict="user_id,service_type,service_id").execute()
 
     return {"status": "connected", "name": vercel_username}
 
@@ -144,20 +99,6 @@ async def connect_vercel(body: ConnectRequest, user_id: str = Depends(get_user_i
 @router.delete("/disconnect")
 async def disconnect_vercel(user_id: str = Depends(get_user_id)):
     """Remove the user's Vercel connection."""
-    # Fetch the stored token + webhook_id before deleting
-    result = supabase.table("connected_services") \
-        .select("api_token, webhook_id") \
-        .eq("user_id", user_id) \
-        .eq("service_type", "vercel") \
-        .single() \
-        .execute()
-
-    if result.data:
-        token = decrypt_token(result.data["api_token"])
-        webhook_id = result.data.get("webhook_id")
-        if webhook_id:
-            await _delete_vercel_webhook(token, webhook_id)
-
     supabase.table("connected_services") \
         .delete() \
         .eq("user_id", user_id) \

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { apiFetch } from "@/lib/api";
+import { createClient } from "@/lib/supabase/client";
 import { groupByDate, timeAgo } from "@/lib/utils";
 import type {
   Project, ProjectService, Deployment, Commit, PullRequest,
@@ -245,6 +246,50 @@ export default function ProjectPage() {
       })
       .catch(() => {})
       .finally(() => setLoading(false));
+  }, [id]);
+
+  // Supabase Realtime — refresh data when scheduler writes new events for this project
+  const projectRef = useRef<Project | null>(null);
+  useEffect(() => { projectRef.current = project; }, [project]);
+
+  useEffect(() => {
+    const supabase = createClient();
+    const channel = supabase
+      .channel(`project-events-${id}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "events", filter: `project_id=eq.${id}` },
+        (payload) => {
+          const row = payload.new as Record<string, unknown>;
+          const svcType = row.service_type as string;
+          const p = projectRef.current;
+          if (!p) return;
+
+          if (svcType === "vercel") {
+            const svc = p.project_services.find((s) => s.service_type === "vercel");
+            if (svc) {
+              apiFetch(`/api/vercel/deployments?limit=20&projectId=${svc.resource_id}`)
+                .then((r) => r.json()).then((d) => setDeployments(d.deployments ?? [])).catch(() => {});
+            }
+          } else if (svcType === "render") {
+            const svc = p.project_services.find((s) => s.service_type === "render");
+            if (svc) {
+              apiFetch(`/api/render/deploys?serviceId=${svc.resource_id}&limit=20`)
+                .then((r) => r.json()).then((d) => setRenderDeploys(d.deploys ?? [])).catch(() => {});
+            }
+          } else if (svcType === "github") {
+            const svc = p.project_services.find((s) => s.service_type === "github");
+            if (svc) {
+              apiFetch(`/api/github/commits?repo=${svc.resource_id}&limit=20`)
+                .then((r) => r.json()).then((d) => setCommits(d.commits ?? [])).catch(() => {});
+              apiFetch(`/api/github/pulls?repo=${svc.resource_id}`)
+                .then((r) => r.json()).then((d) => setPulls(d.pulls ?? [])).catch(() => {});
+            }
+          }
+        }
+      )
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
   }, [id]);
 
   // Auto-poll when a deploy is in-progress; trigger insight refresh when build settles

@@ -9,3 +9,4 @@ anthropic==0.34.2
 python-dotenv==1.0.1
 openai>=1.30.0
 slowapi==0.1.9
+apscheduler==3.10.4
