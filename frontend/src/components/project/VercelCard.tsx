@@ -12,7 +12,7 @@ export function VercelCard({ service, deployments, selected, onClick, onUnlink, 
   const readyCount = deployments.filter((d) => d.state === "READY").length;
   const successRate = deployments.length ? Math.round((readyCount / deployments.length) * 100) : null;
   const weekFails = deployments.filter((d) => d.state === "ERROR" && Date.now() - d.created_at < 7 * 86400000).length;
-  const hasIssue = successRate !== null && successRate < 50 && deployments.length >= 3;
+  const hasIssue = successRate !== null && successRate < 50 && deployments.length >= 3 && latest?.state === "ERROR";
 
   return (
     <div
@@ -105,7 +105,7 @@ export function VercelCard({ service, deployments, selected, onClick, onUnlink, 
       )}
       <div className="flex items-center justify-between mt-3">
         <a
-          href={latest?.url ? `https://${latest.url}` : "https://vercel.com/dashboard"}
+          href={latest?.team_slug ? `https://vercel.com/${latest.team_slug}/${latest.name || service.resource_name}` : "https://vercel.com/dashboard"}
           target="_blank"
           rel="noopener noreferrer"
           onClick={(e) => e.stopPropagation()}

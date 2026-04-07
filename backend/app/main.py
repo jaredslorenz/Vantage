@@ -6,7 +6,7 @@ from slowapi.errors import RateLimitExceeded
 from app.core.config import settings
 from app.core.logger import logger
 from app.core.limiter import limiter
-from app.routers import health, vercel, services, projects, github, render, insights, supabase_mgmt, events, uptime
+from app.routers import health, vercel, services, projects, github, render, insights, supabase_mgmt, events, uptime, webhooks
 
 app = FastAPI(title="Vantage API", version="0.1.0")
 app.state.limiter = limiter
@@ -16,7 +16,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_url],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "PUT", "OPTIONS"],
+    allow_methods=["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -44,3 +44,4 @@ app.include_router(insights.router)
 app.include_router(supabase_mgmt.router)
 app.include_router(events.router)
 app.include_router(uptime.router)
+app.include_router(webhooks.router)

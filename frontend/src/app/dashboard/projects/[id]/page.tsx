@@ -1,14 +1,15 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useParams } from "next/navigation";
+import Link from "next/link";
 import { apiFetch } from "@/lib/api";
 import { groupByDate, timeAgo } from "@/lib/utils";
 import type {
   Project, ProjectService, Deployment, Commit, PullRequest,
   RenderDeploy, VercelProject, GitHubRepo, RenderService,
   SupabaseProject, SupabaseServiceHealth, SupabaseOverview,
-  DeployAnalysis, UptimeStatus, EnvVar, LogLine,
+  DeployAnalysis, UptimeStatus, EnvVar, LogLine, Investigation,
 } from "@/types/project";
 import { InsightPanel } from "@/components/project/InsightPanel";
 import { BuildTrendChart } from "@/components/project/BuildTrendChart";
@@ -162,7 +163,6 @@ function LogDrawer({ logsUrl, title, subtitle, onClose }: {
 // --- Main page ---
 export default function ProjectPage() {
   const { id } = useParams<{ id: string }>();
-  const router = useRouter();
 
   const [project, setProject] = useState<Project | null>(null);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
@@ -191,8 +191,11 @@ export default function ProjectPage() {
   const [envVars, setEnvVars] = useState<EnvVar[]>([]);
   const [envVarsLoaded, setEnvVarsLoaded] = useState(false);
   const [proactiveAlerts, setProactiveAlerts] = useState<Record<string, DeployAnalysis>>({});
+  const [investigation, setInvestigation] = useState<Investigation | null>(null);
+  const [investigating, setInvestigating] = useState(false);
   const prevVercelStates = useRef<Record<string, string>>({});
   const prevRenderStates = useRef<Record<string, string>>({});
+  const autoInvestigated = useRef(false);
 
   useEffect(() => {
     apiFetch(`/api/projects/${id}`)
@@ -257,14 +260,21 @@ export default function ProjectPage() {
           .then((r) => r.json())
           .then((d) => {
             const newDeploys = d.deployments ?? [];
-            // Proactive failure analysis — auto-run when a build goes BUILDING → ERROR
-            for (const dep of newDeploys as { id: string; state: string }[]) {
-              if (prevVercelStates.current[dep.id] === "BUILDING" && dep.state === "ERROR") {
-                apiFetch(`/api/insights/deployment/${dep.id}`, { method: "POST" })
-                  .then((r) => r.json())
-                  .then((analysis) => setProactiveAlerts((prev) => ({ ...prev, [dep.id]: analysis })))
-                  .catch(() => {});
-              }
+            // Auto-investigate when a build goes BUILDING → ERROR
+            const justFailed = (newDeploys as { id: string; state: string }[]).some(
+              (dep) => prevVercelStates.current[dep.id] === "BUILDING" && dep.state === "ERROR"
+            );
+            if (justFailed) {
+              setInvestigating(true);
+              setInvestigation(null);
+              apiFetch("/api/insights/investigate", {
+                method: "POST",
+                body: JSON.stringify({ project_id: project?.id, service_type: "vercel" }),
+              })
+                .then((r) => r.json())
+                .then((data) => setInvestigation(data))
+                .catch(() => {})
+                .finally(() => setInvestigating(false));
             }
             const settled = newDeploys.some(
               (dep: { id: string; state: string }) =>
@@ -284,6 +294,11 @@ export default function ProjectPage() {
           .then((d) => {
             const newDeploys = d.deploys ?? [];
             const settledStatuses = ["live", "build_failed", "canceled", "deactivated"];
+            const justFailed = newDeploys.some(
+              (dep: { id: string; status: string }) =>
+                ["build_in_progress", "update_in_progress", "pre_deploy_in_progress"].includes(prevRenderStates.current[dep.id]) &&
+                dep.status === "build_failed"
+            );
             const settled = newDeploys.some(
               (dep: { id: string; status: string }) =>
                 ["build_in_progress", "update_in_progress", "pre_deploy_in_progress"].includes(prevRenderStates.current[dep.id]) &&
@@ -291,6 +306,18 @@ export default function ProjectPage() {
             );
             prevRenderStates.current = Object.fromEntries(newDeploys.map((dep: { id: string; status: string }) => [dep.id, dep.status]));
             setRenderDeploys(newDeploys);
+            if (justFailed) {
+              setInvestigating(true);
+              setInvestigation(null);
+              apiFetch("/api/insights/investigate", {
+                method: "POST",
+                body: JSON.stringify({ project_id: project?.id, service_type: "render" }),
+              })
+                .then((r) => r.json())
+                .then((data) => setInvestigation(data))
+                .catch(() => {})
+                .finally(() => setInvestigating(false));
+            }
             if (settled) setInsightRefreshKey((k) => k + 1);
           })
           .catch(() => {});
@@ -299,6 +326,38 @@ export default function ProjectPage() {
 
     return () => clearInterval(interval);
   }, [deployments, renderDeploys, project]);
+
+  // Auto-investigate on page load if failures detected
+  useEffect(() => {
+    if (loading || autoInvestigated.current || !project) return;
+    const renderSvc = project.project_services.find((s) => s.service_type === "render");
+    const vercelSvc = project.project_services.find((s) => s.service_type === "vercel");
+    const supabaseSvc = project.project_services.find((s) => s.service_type === "supabase");
+    let failingService: string | null = null;
+    if (renderSvc && renderDeploys.length >= 3 && renderDeploys[0]?.status === "build_failed") {
+      const rate = Math.round(renderDeploys.filter((d) => d.status === "live").length / renderDeploys.length * 100);
+      if (rate < 50) failingService = "render";
+    }
+    if (!failingService && vercelSvc && deployments.length >= 3 && deployments[0]?.state === "ERROR") {
+      const rate = Math.round(deployments.filter((d) => d.state === "READY").length / deployments.length * 100);
+      if (rate < 50) failingService = "vercel";
+    }
+    if (!failingService && supabaseSvc && supabaseHealth.some((s) => s.status === "ACTIVE_UNHEALTHY")) {
+      failingService = "supabase";
+    }
+    if (!failingService) return;
+    autoInvestigated.current = true;
+    setInvestigating(true);
+    setInvestigation(null);
+    apiFetch("/api/insights/investigate", {
+      method: "POST",
+      body: JSON.stringify({ project_id: project.id, service_type: failingService }),
+    })
+      .then((r) => r.json())
+      .then((data) => setInvestigation(data))
+      .catch(() => {})
+      .finally(() => setInvestigating(false));
+  }, [loading, deployments, renderDeploys, supabaseHealth, project]);
 
   // Uptime checks — fire once when we have deployment URLs to ping
   useEffect(() => {
@@ -426,11 +485,6 @@ export default function ProjectPage() {
     if (serviceType === "supabase") { setSupabaseHealth([]); setSupabaseOverview(null); }
   };
 
-  const handleDelete = async () => {
-    if (!confirm(`Delete project "${project?.name}"? This cannot be undone.`)) return;
-    await apiFetch(`/api/projects/${id}`, { method: "DELETE" });
-    router.push("/dashboard/projects");
-  };
 
   if (loading) {
     return (
@@ -460,9 +514,15 @@ export default function ProjectPage() {
           <button onClick={openLinkPanel} className="text-[12px] font-medium px-3.5 py-1.5 rounded-button bg-white/20 backdrop-blur text-white hover:bg-white/30 transition-all border border-white/30">
             + Link service
           </button>
-          <button onClick={handleDelete} className="text-[12px] font-medium px-3.5 py-1.5 rounded-button border border-red-400/60 text-red-300 hover:bg-red-400 hover:text-white hover:border-red-400 transition-all">
-            Delete
-          </button>
+          <Link
+            href={`/dashboard/projects/${id}/settings`}
+            className="text-[12px] font-medium px-3.5 py-1.5 rounded-button bg-white/20 backdrop-blur text-white hover:bg-white/30 transition-all border border-white/30 flex items-center gap-1.5"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+            </svg>
+            Settings
+          </Link>
         </div>
       </div>
 
@@ -470,13 +530,13 @@ export default function ProjectPage() {
       {(() => {
         const alerts: { service: string; message: string; svcId: string }[] = [];
         const renderSvc = project.project_services.find(s => s.service_type === "render");
-        if (renderSvc && renderDeploys.length >= 3) {
+        if (renderSvc && renderDeploys.length >= 3 && renderDeploys[0]?.status === "build_failed") {
           const live = renderDeploys.filter(d => d.status === "live").length;
           const rate = Math.round(live / renderDeploys.length * 100);
           if (rate < 50) alerts.push({ service: "Render", message: `Render has a ${rate}% success rate in the last ${renderDeploys.length} deploys. Investigate immediately.`, svcId: renderSvc.id });
         }
         const vercelSvc = project.project_services.find(s => s.service_type === "vercel");
-        if (vercelSvc && deployments.length >= 3) {
+        if (vercelSvc && deployments.length >= 3 && deployments[0]?.state === "ERROR") {
           const ready = deployments.filter(d => d.state === "READY").length;
           const rate = Math.round(ready / deployments.length * 100);
           if (rate < 50) alerts.push({ service: "Vercel", message: `Vercel has a ${rate}% success rate across recent deployments. Investigate immediately.`, svcId: vercelSvc.id });
@@ -489,26 +549,26 @@ export default function ProjectPage() {
         if (alerts.length === 0) return null;
         const alert = alerts[0];
         return (
-          <div className="mb-5 flex items-center justify-between gap-4 bg-amber-50 border border-amber-200 rounded-card px-5 py-4 shadow-card animate-slide-up">
-            <div className="flex items-start gap-3">
-              <span className="text-xl shrink-0">⚠️</span>
-              <div>
-                <p className="text-[13px] font-semibold text-amber-900">Deployment Issue Detected</p>
-                <p className="text-[12px] text-amber-700 mt-0.5">{alert.message}</p>
-              </div>
+          <div className="mb-5 flex items-start gap-3 bg-amber-50 border border-amber-200 rounded-card px-5 py-4 shadow-card animate-slide-up">
+            <span className="text-xl shrink-0">⚠️</span>
+            <div>
+              <p className="text-[13px] font-semibold text-amber-900">Deployment Issue Detected</p>
+              <p className="text-[12px] text-amber-700 mt-0.5">{alert.message}</p>
             </div>
-            <button
-              onClick={() => setSelectedService(alert.svcId)}
-              className="shrink-0 text-[12px] font-semibold px-4 py-2 rounded-button bg-red-500 text-white hover:bg-red-600 transition-colors shadow-sm"
-            >
-              Investigate
-            </button>
           </div>
         );
       })()}
 
-      {/* AI Insight */}
-      {project.project_services.length > 0 && <InsightPanel projectId={project.id} refreshKey={insightRefreshKey} />}
+      {/* AI Insight + Investigation (unified) */}
+      {project.project_services.length > 0 && (
+        <InsightPanel
+          projectId={project.id}
+          refreshKey={insightRefreshKey}
+          investigation={investigation}
+          investigating={investigating}
+          onDismiss={() => setInvestigation(null)}
+        />
+      )}
 
       {/* Service cards */}
       {project.project_services.length === 0 ? (
@@ -529,16 +589,16 @@ export default function ProjectPage() {
         >
           {project.project_services.map((svc) => {
             if (svc.service_type === "vercel") {
-              return <VercelCard key={svc.id} service={svc} deployments={deployments} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} uptime={uptimeData[`vercel:${svc.resource_id}`]} onInvestigate={() => setSelectedService(svc.id)} />;
+              return <VercelCard key={svc.id} service={svc} deployments={deployments} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} uptime={uptimeData[`vercel:${svc.resource_id}`]} />;
             }
             if (svc.service_type === "github") {
               return <GitHubCard key={svc.id} service={svc} commits={commits} pulls={pulls} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
             }
             if (svc.service_type === "render") {
-              return <RenderCard key={svc.id} service={svc} deploys={renderDeploys} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} onInvestigate={() => setSelectedService(svc.id)} />;
+              return <RenderCard key={svc.id} service={svc} deploys={renderDeploys} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
             }
             if (svc.service_type === "supabase") {
-              return <SupabaseCard key={svc.id} service={svc} health={supabaseHealth} overview={supabaseOverview} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} onInvestigate={() => setSelectedService(svc.id)} />;
+              return <SupabaseCard key={svc.id} service={svc} health={supabaseHealth} overview={supabaseOverview} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
             }
             return null;
           })}
@@ -696,8 +756,8 @@ export default function ProjectPage() {
                     ) : envVars.length === 0 ? (
                       <div className="px-5 py-8 text-[12px] text-gray-400 text-center">No environment variables found</div>
                     ) : (
-                      envVars.map((v) => (
-                        <div key={v.key} className="flex items-center justify-between px-5 py-2.5 border-b border-gray-100 last:border-0 hover:bg-gray-50/40 transition-colors group">
+                      envVars.map((v, i) => (
+                        <div key={i} className="flex items-center justify-between px-5 py-2.5 border-b border-gray-100 last:border-0 hover:bg-gray-50/40 transition-colors group">
                           <div className="flex items-center gap-3 min-w-0">
                             <span className="text-[12px] font-mono font-medium text-gray-800 truncate">{v.key}</span>
                             <span className="text-[10px] font-mono text-gray-300 shrink-0">••••••••</span>
@@ -818,7 +878,7 @@ export default function ProjectPage() {
                                 maxBuildDuration={maxBuildDuration}
                                 githubRepo={githubSvc?.resource_id}
                                 initialAnalysis={proactiveAlerts[d.id]}
-                                onViewLogs={(depId, name) => setLogDrawer({ logsUrl: `/api/vercel/deployments/${depId}/logs`, title: "Build Logs", subtitle: name })}
+                                logsHref={d.team_slug ? `https://vercel.com/${d.team_slug}/${d.name || activeService?.resource_name}/deployments/${d.id}` : undefined}
                                 onRedeploy={async (depId) => {
                                   setDeploying(true);
                                   try {

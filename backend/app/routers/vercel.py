@@ -1,13 +1,10 @@
-import hashlib
+import asyncio
 import re
-import secrets
+import json
 import httpx
-from base64 import urlsafe_b64encode
-from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
-from app.core.config import settings
+from app.core.logger import logger
 from app.core.encryption import encrypt_token, decrypt_token
 from app.core.security import get_user_id
 from app.core.supabase import supabase
@@ -19,31 +16,31 @@ def _strip_ansi(text: str) -> str:
 
 
 async def fetch_deployment_logs(deployment_id: str, token: str, client: httpx.AsyncClient) -> list[str]:
-    """
-    Fetch build log lines for a Vercel deployment.
-    Returns up to 60 cleaned lines focused on errors and build output.
-    """
+    """Fetch build log lines for a Vercel deployment via the events API."""
     resp = await client.get(
         f"{VERCEL_API}/v2/deployments/{deployment_id}/events",
         headers={"Authorization": f"Bearer {token}"},
-        params={"direction": "backward", "limit": 100},
+        params={"direction": "forward", "limit": 100},
     )
+    if resp.status_code == 200 and not resp.json():
+        resp = await client.get(
+            f"{VERCEL_API}/v2/deployments/{deployment_id}/events",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"direction": "backward", "limit": 100},
+        )
     if resp.status_code != 200:
         return []
 
     events = resp.json() if isinstance(resp.json(), list) else []
-
     lines = []
-    for event in reversed(events):  # backward direction returns newest first
+    for event in reversed(events):
         text = _strip_ansi(event.get("text", ""))
         if not text:
             continue
         event_type = event.get("type", "")
-        # Include stderr always, stdout for commands and non-empty output
         if event_type in ("stderr", "command") or (event_type == "stdout" and text):
             lines.append(f"[{event_type}] {text}")
 
-    # Return last 60 lines — enough context without bloating the prompt
     return lines[-60:]
 
 VERCEL_API = "https://api.vercel.com"
@@ -58,154 +55,56 @@ def _get_vercel_token(user_id: str) -> str:
         .single() \
         .execute()
 
-    if not result.data:
+    if not result.data or not result.data.get("api_token"):
         raise HTTPException(status_code=404, detail="Vercel not connected")
-
-    if not result.data.get("api_token"):
-        raise HTTPException(status_code=403, detail="Vercel API token not configured")
 
     return decrypt_token(result.data["api_token"])
 
 router = APIRouter(prefix="/api/vercel", tags=["vercel"])
 
-VERCEL_AUTH_URL = "https://vercel.com/oauth/authorize"
-VERCEL_TOKEN_URL = "https://api.vercel.com/login/oauth/token"
 
-
-def _generate_code_challenge(verifier: str) -> str:
-    digest = hashlib.sha256(verifier.encode()).digest()
-    return urlsafe_b64encode(digest).rstrip(b"=").decode()
-
-
-@router.get("/connect")
-async def connect_vercel(user_id: str = Depends(get_user_id)):
-    """
-    Step 1: Redirect user to Vercel OAuth consent screen.
-    Called from Next.js when user clicks 'Connect Vercel'.
-    """
-    state = secrets.token_urlsafe(32)
-    nonce = secrets.token_urlsafe(32)
-    code_verifier = secrets.token_urlsafe(43)
-    code_challenge = _generate_code_challenge(code_verifier)
-
-    supabase.table("oauth_states").insert({
-        "user_id": user_id,
-        "state": state,
-        "provider": "vercel",
-        "code_verifier": code_verifier,
-        "nonce": nonce,
-    }).execute()
-
-    params = urlencode({
-        "client_id": settings.vercel_client_id,
-        "response_type": "code",
-        "redirect_uri": f"{settings.backend_url}/api/vercel/callback",
-        "state": state,
-        "nonce": nonce,
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
-    })
-
-    return {"url": f"{VERCEL_AUTH_URL}?{params}"}
-
-
-@router.get("/callback")
-async def vercel_callback(
-    state: str = Query(...),
-    code: str = Query(None),
-    error: str = Query(None),
-    error_description: str = Query(None),
-):
-    """
-    Step 2: Vercel redirects here after user authorizes.
-    Exchange code for access token and store it.
-    """
-    result = supabase.table("oauth_states") \
-        .select("*") \
-        .eq("state", state) \
-        .eq("provider", "vercel") \
-        .single() \
-        .execute()
-
-    if error or not code:
-        return RedirectResponse(url=f"{settings.frontend_url}/dashboard/services?error=oauth_failed")
-
-    if not result.data:
-        return RedirectResponse(url=f"{settings.frontend_url}/dashboard/services?error=invalid_state")
-
-    user_id = result.data["user_id"]
-    code_verifier = result.data["code_verifier"]
-
-    supabase.table("oauth_states").delete().eq("state", state).execute()
-
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            VERCEL_TOKEN_URL,
-            data={
-                "grant_type": "authorization_code",
-                "client_id": settings.vercel_client_id,
-                "client_secret": settings.vercel_client_secret,
-                "code": code,
-                "code_verifier": code_verifier,
-                "redirect_uri": f"{settings.backend_url}/api/vercel/callback",
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-
-    if response.status_code != 200:
-        return RedirectResponse(url=f"{settings.frontend_url}/dashboard/services?error=token_exchange_failed")
-
-    token_data = response.json()
-    access_token = token_data.get("access_token")
-    refresh_token = token_data.get("refresh_token")
-    expires_in = token_data.get("expires_in")
-
-    # Fetch Vercel user info to get their user ID
-    async with httpx.AsyncClient() as client:
-        user_resp = await client.post(
-            "https://api.vercel.com/login/oauth/userinfo",
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-
-    vercel_user = user_resp.json() if user_resp.status_code == 200 else {}
-    vercel_user_id = vercel_user.get("sub", "")
-    vercel_username = vercel_user.get("preferred_username", "")
-
-    supabase.table("connected_services").upsert({
-        "user_id": user_id,
-        "service_type": "vercel",
-        "service_id": vercel_user_id,
-        "service_name": vercel_username or "Vercel",
-        "oauth_access_token": encrypt_token(access_token),
-        "oauth_refresh_token": encrypt_token(refresh_token) if refresh_token else None,
-        "config": {"expires_in": expires_in},
-        "is_active": True,
-        "health_status": "healthy",
-    }, on_conflict="user_id,service_type,service_id").execute()
-
-    return RedirectResponse(url=f"{settings.frontend_url}/dashboard/services")
-
-
-@router.delete("/disconnect")
-async def disconnect_vercel(user_id: str = Depends(get_user_id)):
-    """Remove the user's Vercel connection."""
-    supabase.table("connected_services") \
-        .delete() \
-        .eq("user_id", user_id) \
-        .eq("service_type", "vercel") \
-        .execute()
-
-    return {"status": "disconnected"}
-
-
-class ApiTokenRequest(BaseModel):
+class ConnectRequest(BaseModel):
     token: str
 
 
-@router.post("/api-token")
-async def save_api_token(body: ApiTokenRequest, user_id: str = Depends(get_user_id)):
-    """Validate and store a Vercel Personal Access Token."""
-    # Verify the token works before storing it
+async def _register_vercel_webhook(token: str, webhook_url: str) -> str | None:
+    """Register a Vercel webhook and return the webhook ID, or None on failure."""
+    from app.core.config import settings as _settings
+    if not _settings.vercel_webhook_secret:
+        return None
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{VERCEL_API}/v1/webhooks",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "url": webhook_url,
+                "events": [
+                    "deployment.created",
+                    "deployment.succeeded",
+                    "deployment.ready",
+                    "deployment.error",
+                    "deployment.canceled",
+                ],
+            },
+        )
+    if resp.status_code in (200, 201):
+        return resp.json().get("id")
+    return None
+
+
+async def _delete_vercel_webhook(token: str, webhook_id: str) -> None:
+    """Delete a Vercel webhook by ID."""
+    async with httpx.AsyncClient() as client:
+        await client.delete(
+            f"{VERCEL_API}/v1/webhooks/{webhook_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+
+@router.post("/connect")
+async def connect_vercel(body: ConnectRequest, user_id: str = Depends(get_user_id)):
+    """Validate a Vercel Personal Access Token and store it."""
+    from app.core.config import settings as _settings
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"{VERCEL_API}/v2/user",
@@ -215,25 +114,58 @@ async def save_api_token(body: ApiTokenRequest, user_id: str = Depends(get_user_
     if resp.status_code != 200:
         raise HTTPException(status_code=400, detail="Invalid token — could not authenticate with Vercel")
 
+    user_data = resp.json().get("user", resp.json())
+    vercel_user_id = user_data.get("id", "")
+    # Prefer defaultTeamSlug (used in dashboard URLs), fall back to username
+    vercel_username = user_data.get("defaultTeamSlug") or user_data.get("username") or user_data.get("name") or "Vercel"
+
+    # Register webhook so we get real-time deployment events
+    webhook_id = None
+    webhook_url = f"{_settings.backend_url}/api/webhooks/vercel"
+    webhook_id = await _register_vercel_webhook(body.token, webhook_url)
+
+    row: dict = {
+        "user_id": user_id,
+        "service_type": "vercel",
+        "service_id": vercel_user_id,
+        "service_name": vercel_username,
+        "api_token": encrypt_token(body.token),
+        "is_active": True,
+        "health_status": "healthy",
+    }
+    if webhook_id:
+        row["webhook_id"] = webhook_id
+
+    supabase.table("connected_services").upsert(row, on_conflict="user_id,service_type,service_id").execute()
+
+    return {"status": "connected", "name": vercel_username}
+
+
+@router.delete("/disconnect")
+async def disconnect_vercel(user_id: str = Depends(get_user_id)):
+    """Remove the user's Vercel connection."""
+    # Fetch the stored token + webhook_id before deleting
+    result = supabase.table("connected_services") \
+        .select("api_token, webhook_id") \
+        .eq("user_id", user_id) \
+        .eq("service_type", "vercel") \
+        .single() \
+        .execute()
+
+    if result.data:
+        token = decrypt_token(result.data["api_token"])
+        webhook_id = result.data.get("webhook_id")
+        if webhook_id:
+            await _delete_vercel_webhook(token, webhook_id)
+
     supabase.table("connected_services") \
-        .update({"api_token": encrypt_token(body.token)}) \
+        .delete() \
         .eq("user_id", user_id) \
         .eq("service_type", "vercel") \
         .execute()
 
-    return {"status": "saved"}
+    return {"status": "disconnected"}
 
-
-@router.delete("/api-token")
-async def remove_api_token(user_id: str = Depends(get_user_id)):
-    """Remove the stored Vercel Personal Access Token."""
-    supabase.table("connected_services") \
-        .update({"api_token": None}) \
-        .eq("user_id", user_id) \
-        .eq("service_type", "vercel") \
-        .execute()
-
-    return {"status": "removed"}
 
 
 class RedeployRequest(BaseModel):
@@ -310,34 +242,69 @@ async def get_vercel_projects(user_id: str = Depends(get_user_id)):
 
 
 @router.get("/deployments/{deployment_id}/logs")
-async def get_deployment_logs(deployment_id: str, user_id: str = Depends(get_user_id)):
+async def get_deployment_logs(
+    deployment_id: str,
+    user_id: str = Depends(get_user_id),
+    projectId: str = Query(None),
+):
     """Fetch structured build log lines for a Vercel deployment."""
     token = _get_vercel_token(user_id)
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(
-            f"{VERCEL_API}/v2/deployments/{deployment_id}/events",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"direction": "backward", "limit": 200},
-        )
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Failed to fetch deployment logs")
-
-    body = resp.json()
-    raw_events = body if isinstance(body, list) else body.get("events", body.get("data", []))
-    if not isinstance(raw_events, list):
-        raw_events = []
-
-    # direction=backward returns newest first — reverse for chronological order
     lines = []
-    for event in reversed(raw_events):
-        text = _strip_ansi(event.get("text", "")).strip()
-        if not text:
-            continue
-        event_type = event.get("type", "stdout")
-        if event_type in ("stderr", "command", "stdout"):
-            lines.append({"type": event_type, "text": text})
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # Try runtime-logs streaming endpoint first (requires projectId)
+        if projectId:
+            try:
+                async with client.stream(
+                    "GET",
+                    f"{VERCEL_API}/v1/projects/{projectId}/deployments/{deployment_id}/runtime-logs",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=httpx.Timeout(connect=10.0, read=5.0, write=5.0, pool=5.0),
+                ) as stream:
+                    if stream.status_code == 200:
+                        try:
+                            async for raw_line in stream.aiter_lines():
+                                raw_line = raw_line.strip()
+                                if not raw_line:
+                                    continue
+                                if raw_line.startswith("data:"):
+                                    raw_line = raw_line[5:].strip()
+                                try:
+                                    entry = json.loads(raw_line)
+                                    text = _strip_ansi(entry.get("message") or entry.get("text") or "").strip()
+                                    if text:
+                                        lines.append({"type": entry.get("level", "stdout"), "text": text})
+                                except json.JSONDecodeError:
+                                    if raw_line:
+                                        lines.append({"type": "stdout", "text": _strip_ansi(raw_line)})
+                        except (httpx.ReadTimeout, asyncio.TimeoutError):
+                            pass  # Collected what we could before stream timed out
+            except Exception:
+                pass  # Fall through to events endpoint
+
+        # Fall back to events endpoint
+        if not lines:
+            resp = await client.get(
+                f"{VERCEL_API}/v2/deployments/{deployment_id}/events",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"direction": "forward", "limit": 200},
+            )
+            if resp.status_code == 200 and not resp.json():
+                resp = await client.get(
+                    f"{VERCEL_API}/v2/deployments/{deployment_id}/events",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"direction": "backward", "limit": 200},
+                )
+            if resp.status_code == 200:
+                body = resp.json()
+                raw_events = body if isinstance(body, list) else body.get("events", body.get("data", []))
+                for event in reversed(raw_events if isinstance(raw_events, list) else []):
+                    text = _strip_ansi(event.get("text", "")).strip()
+                    if text and event.get("type") in ("stderr", "command", "stdout"):
+                        lines.append({"type": event.get("type"), "text": text})
+
+    if not lines:
+        raise HTTPException(status_code=404, detail="No logs available for this deployment")
 
     return {"lines": lines, "deployment_id": deployment_id}
 
@@ -383,9 +350,13 @@ async def get_vercel_deployments(
     async with httpx.AsyncClient() as client:
         # Get teams so we can query each scope
         teams_resp = await client.get(f"{VERCEL_API}/v2/teams", headers=headers)
-        team_ids: list[str | None] = [None]  # None = personal scope
+        team_ids: list[str | None] = []
+        team_slug_map: dict[str | None, str | None] = {None: None}
         if teams_resp.status_code == 200:
-            team_ids += [t["id"] for t in teams_resp.json().get("teams", [])]
+            for t in teams_resp.json().get("teams", []):
+                team_ids.append(t["id"])
+                team_slug_map[t["id"]] = t.get("slug")
+        team_ids.append(None)  # personal scope last so team slugs win deduplication
 
         all_deployments: list[dict] = []
         for team_id in team_ids:
@@ -401,7 +372,10 @@ async def get_vercel_deployments(
                 params=params,
             )
             if resp.status_code == 200:
-                all_deployments += resp.json().get("deployments", [])
+                batch = resp.json().get("deployments", [])
+                for dep in batch:
+                    dep["_team_slug"] = team_slug_map.get(team_id)
+                all_deployments += batch
 
     # Sort by creation time descending and deduplicate
     seen: set[str] = set()
@@ -428,6 +402,7 @@ async def get_vercel_deployments(
                 "created_at": d.get("createdAt"),
                 "ready_at": ready_at,
                 "build_duration": build_duration,
+                "team_slug": d.get("_team_slug"),
             })
 
     return {"deployments": deployments[:limit]}

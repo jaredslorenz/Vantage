@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { apiFetch } from "@/lib/api";
+import { createClient } from "@/lib/supabase/client";
 import { SiRender } from "react-icons/si";
 
 type EventStatus = "success" | "error" | "building" | "canceled" | "open" | "closed" | "merged" | "draft";
@@ -126,6 +127,54 @@ export default function EventsPage() {
       })
       .catch(() => {})
       .finally(() => setLoading(false));
+
+    // Realtime: update events list when new rows land in the events table
+    const supabase = createClient();
+    const channel = supabase
+      .channel("events-feed")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "events" },
+        (payload) => {
+          if (payload.eventType === "INSERT" || payload.eventType === "UPDATE") {
+            const row = payload.new as Record<string, unknown>;
+            const eventTypeRaw = (row.event_type as string) ?? "";
+            const typeMap: Record<string, string> = {
+              "deployment.created": "deployment",
+              "deployment.succeeded": "deployment",
+              "deployment.ready": "deployment",
+              "deployment.error": "deployment",
+              "deployment.canceled": "deployment",
+              deploy: "deploy",
+              commit: "commit",
+              pull_request: "pull_request",
+              ci_run: "ci_run",
+            };
+            const incoming: Event = {
+              id: (row.external_id as string) || (row.id as string),
+              type: (typeMap[eventTypeRaw] ?? eventTypeRaw) as EventType,
+              service: (row.service_type as ServiceType) ?? "vercel",
+              title: (row.title as string) ?? "",
+              subtitle: (row.subtitle as string) ?? "",
+              status: (row.status as EventStatus) ?? "building",
+              timestamp: (row.occurred_at as string) ?? "",
+              url: (row.external_url as string) ?? "",
+            };
+            setEvents((prev) => {
+              const idx = prev.findIndex((e) => e.id === incoming.id);
+              if (idx !== -1) {
+                const next = [...prev];
+                next[idx] = incoming;
+                return next;
+              }
+              return [incoming, ...prev];
+            });
+          }
+        }
+      )
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
   }, []);
 
   const visible = filter === "All" ? events : events.filter((e) => e.service === filter);

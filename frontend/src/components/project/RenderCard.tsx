@@ -16,7 +16,7 @@ export function RenderCard({ service, deploys, selected, onClick, onUnlink, onIn
   const successRate = deploys.length ? Math.round((liveCount / deploys.length) * 100) : null;
   const isBuilding = latest?.status === "build_in_progress" || latest?.status === "update_in_progress";
   const weekFails = deploys.filter((d) => d.status === "build_failed" && Date.now() - new Date(d.created_at).getTime() < 7 * 86400000).length;
-  const hasIssue = successRate !== null && successRate < 50 && deploys.length >= 3;
+  const hasIssue = successRate !== null && successRate < 50 && deploys.length >= 3 && latest?.status === "build_failed";
 
   return (
     <div

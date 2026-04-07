@@ -2,7 +2,6 @@
 
 import { useEffect, useState } from "react";
 import { SiRender, SiSupabase } from "react-icons/si";
-import { useSearchParams } from "next/navigation";
 import { apiFetch } from "@/lib/api";
 
 interface ConnectedService {
@@ -132,11 +131,6 @@ const SERVICE_META: Record<
 
 const AVAILABLE_SERVICES = ["vercel", "github", "render", "supabase"];
 
-const ERROR_MESSAGES: Record<string, string> = {
-  oauth_failed: "Authorization was denied or failed. Please try again.",
-  invalid_state: "Session expired during authorization. Please try again.",
-  token_exchange_failed: "Could not complete the connection. Please try again.",
-};
 
 function formatDate(iso: string) {
   return new Date(iso).toLocaleDateString("en-US", {
@@ -251,15 +245,8 @@ function TokenStatus({ revokeUrl, revokeLabel, onRemove }: { revokeUrl: string; 
 }
 
 export default function ServicesPage() {
-  const searchParams = useSearchParams();
-  const errorKey = searchParams.get("error");
-  const errorMessage = errorKey
-    ? (ERROR_MESSAGES[errorKey] ?? "Something went wrong. Please try again.")
-    : null;
-
   const [connected, setConnected] = useState<ConnectedService[]>([]);
   const [loading, setLoading] = useState(true);
-  const [connecting, setConnecting] = useState(false);
   const [fetchError, setFetchError] = useState(false);
   const [refreshing, setRefreshing] = useState<string | null>(null);
   const [expandConnect, setExpandConnect] = useState<string | null>(null);
@@ -276,11 +263,6 @@ export default function ServicesPage() {
 
   const connectedTypes = new Set(connected.map((s) => s.service_type));
 
-  const updateService = (serviceType: string, patch: Partial<ConnectedService>) => {
-    setConnected((prev) =>
-      prev.map((s) => (s.service_type === serviceType ? { ...s, ...patch } : s))
-    );
-  };
 
   const handleRefresh = async (serviceType: string) => {
     setRefreshing(serviceType);
@@ -297,23 +279,6 @@ export default function ServicesPage() {
     };
     await apiFetch(urls[serviceType] ?? `/api/${serviceType}/disconnect`, { method: "DELETE" });
     setConnected((prev) => prev.filter((s) => s.service_type !== serviceType));
-  };
-
-  const handleSaveVercelToken = async (token: string) => {
-    const res = await apiFetch("/api/vercel/api-token", {
-      method: "POST",
-      body: JSON.stringify({ token }),
-    });
-    if (!res.ok) {
-      const data = await res.json();
-      throw new Error(data.detail ?? "Invalid token");
-    }
-    updateService("vercel", { has_api_token: true });
-  };
-
-  const handleRemoveVercelToken = async () => {
-    await apiFetch("/api/vercel/api-token", { method: "DELETE" });
-    updateService("vercel", { has_api_token: false });
   };
 
   const handleConnectPAT = async (serviceType: string, token: string) => {
@@ -342,17 +307,6 @@ export default function ServicesPage() {
     setExpandConnect(null);
   };
 
-  const handleConnectVercel = async () => {
-    try {
-      setConnecting(true);
-      const res = await apiFetch("/api/vercel/connect");
-      if (!res.ok) throw new Error();
-      const { url } = await res.json();
-      window.location.href = url;
-    } catch {
-      setConnecting(false);
-    }
-  };
 
   return (
     <>
@@ -378,9 +332,9 @@ export default function ServicesPage() {
         </div>
       </div>
 
-      {(errorMessage || fetchError) && (
+      {fetchError && (
         <div className="mb-5 px-4 py-3 rounded-card bg-red-50 border border-red-200 text-red-700 text-sm">
-          {fetchError ? "Could not reach the server. Make sure the backend is running." : errorMessage}
+          Could not reach the server. Make sure the backend is running.
         </div>
       )}
 
@@ -443,11 +397,7 @@ export default function ServicesPage() {
                     <TokenStatus
                       revokeUrl={meta?.revokeUrl ?? "#"}
                       revokeLabel={meta?.revokeLabel ?? ""}
-                      onRemove={
-                        svc.service_type === "vercel"
-                          ? handleRemoveVercelToken
-                          : () => handleDisconnect(svc.service_type)
-                      }
+                      onRemove={() => handleDisconnect(svc.service_type)}
                     />
                   ) : (
                     <TokenForm
@@ -455,11 +405,7 @@ export default function ServicesPage() {
                       hint={meta?.tokenHint}
                       saveLabel="Save"
                       savingLabel="Verifying..."
-                      onSave={
-                        svc.service_type === "vercel"
-                          ? handleSaveVercelToken
-                          : async () => {}
-                      }
+                      onSave={(token) => handleConnectPAT(svc.service_type, token)}
                     />
                   )}
                 </div>
@@ -476,7 +422,6 @@ export default function ServicesPage() {
         <div className="grid grid-cols-[repeat(auto-fill,minmax(360px,1fr))] gap-3.5">
           {AVAILABLE_SERVICES.filter((t) => !connectedTypes.has(t)).map((type) => {
             const meta = SERVICE_META[type];
-            const isVercel = type === "vercel";
             const isExpanded = expandConnect === type;
 
             return (
@@ -505,15 +450,7 @@ export default function ServicesPage() {
                   </div>
                 )}
 
-                {isVercel ? (
-                  <button
-                    onClick={handleConnectVercel}
-                    disabled={connecting}
-                    className="text-[12px] font-medium px-3 py-1.5 rounded-button bg-linear-to-br from-brand-purple to-brand-cyan text-white shadow-button hover:shadow-lg transition-shadow disabled:opacity-50"
-                  >
-                    {connecting ? "Connecting..." : "Connect"}
-                  </button>
-                ) : isExpanded ? (
+                {isExpanded ? (
                   <TokenForm
                     placeholder={meta?.tokenPlaceholder ?? "paste token here"}
                     hint={meta?.tokenHint}

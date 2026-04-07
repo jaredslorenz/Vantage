@@ -6,10 +6,10 @@ import { timeAgo } from "@/lib/utils";
 import type { Deployment, DeployAnalysis } from "@/types/project";
 import { StatusDot, CopyButton, STATE_COLOR, STATE_LABEL, STATE_BG } from "@/components/project/StatusDot";
 
-export function DeploymentRow({ deployment, index, maxBuildDuration, onRedeploy, onViewLogs, githubRepo, initialAnalysis }: {
+export function DeploymentRow({ deployment, index, maxBuildDuration, onRedeploy, onViewLogs, logsHref, githubRepo, initialAnalysis }: {
   deployment: Deployment; index: number; maxBuildDuration: number;
-  onRedeploy: (id: string) => void; onViewLogs: (id: string, name: string) => void;
-  githubRepo?: string; initialAnalysis?: DeployAnalysis;
+  onRedeploy: (id: string) => void; onViewLogs?: (id: string, name: string) => void;
+  logsHref?: string; githubRepo?: string; initialAnalysis?: DeployAnalysis;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [analysis, setAnalysis] = useState<DeployAnalysis | null>(initialAnalysis ?? null);
@@ -109,15 +109,19 @@ export function DeploymentRow({ deployment, index, maxBuildDuration, onRedeploy,
                 Open deployment ↗
               </a>
             )}
-            <button
-              onClick={() => onViewLogs(deployment.id, deployment.name ?? deployment.id)}
-              className="text-[12px] font-medium px-3.5 py-1.5 rounded-button border border-gray-200 text-gray-600 hover:border-brand-purple hover:text-brand-purple transition-colors flex items-center gap-1.5"
-            >
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-              </svg>
-              View logs
-            </button>
+            {logsHref && (
+              <a
+                href={logsHref}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-[12px] font-medium px-3.5 py-1.5 rounded-button border border-gray-200 text-gray-600 hover:border-brand-purple hover:text-brand-purple transition-colors flex items-center gap-1.5"
+              >
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                  <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+                </svg>
+                View logs ↗
+              </a>
+            )}
             {deployment.state === "ERROR" && !analysis && (
               <button
                 onClick={analyzeFailure}

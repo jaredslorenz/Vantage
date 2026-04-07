@@ -201,6 +201,33 @@ async def _fetch_github(client: httpx.AsyncClient, token: str) -> list:
     return events
 
 
+def _db_event_to_response(row: dict) -> dict:
+    """Normalize an events-table row to the frontend Event shape."""
+    event_type = row.get("event_type", "")
+    # Map DB event_type to frontend type
+    type_map = {
+        "deployment.created": "deployment",
+        "deployment.succeeded": "deployment",
+        "deployment.ready": "deployment",
+        "deployment.error": "deployment",
+        "deployment.canceled": "deployment",
+        "deploy": "deploy",
+        "commit": "commit",
+        "pull_request": "pull_request",
+        "ci_run": "ci_run",
+    }
+    return {
+        "id": row.get("external_id") or str(row.get("id", "")),
+        "type": type_map.get(event_type, event_type),
+        "service": row.get("service_type", ""),
+        "title": row.get("title", ""),
+        "subtitle": row.get("subtitle", ""),
+        "status": row.get("status", "building"),
+        "timestamp": row.get("occurred_at", ""),
+        "url": row.get("external_url") or "",
+    }
+
+
 @router.get("")
 async def get_events(
     user_id: str = Depends(get_user_id),
@@ -215,29 +242,35 @@ async def get_events(
     )
     connected = {s["service_type"] for s in (services_result.data or [])}
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
-    ) as client:
-        tasks = []
-        if "vercel" in connected:
-            token = _get_token(user_id, "vercel")
-            if token:
-                tasks.append(_fetch_vercel(client, token))
-        if "github" in connected:
+    events: list = []
+
+    # Read Vercel and Render events from DB (populated by webhooks / background jobs)
+    db_services = connected & {"vercel", "render"}
+    if db_services:
+        db_result = (
+            supabase.table("events")
+            .select("*")
+            .eq("user_id", user_id)
+            .in_("service_type", list(db_services))
+            .order("occurred_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        for row in db_result.data or []:
+            events.append(_db_event_to_response(row))
+
+    # Fetch GitHub live (no webhook integration yet)
+    if "github" in connected:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+        ) as client:
             token = _get_token(user_id, "github")
             if token:
-                tasks.append(_fetch_github(client, token))
-        if "render" in connected:
-            token = _get_token(user_id, "render")
-            if token:
-                tasks.append(_fetch_render(client, token))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    events: list = []
-    for r in results:
-        if isinstance(r, list):
-            events.extend(r)
+                try:
+                    gh_events = await _fetch_github(client, token)
+                    events.extend(gh_events)
+                except Exception:
+                    pass
 
     events.sort(key=lambda e: e.get("timestamp") or "", reverse=True)
 

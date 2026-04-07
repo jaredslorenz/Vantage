@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     # Vercel
     vercel_client_id: str = ""
     vercel_client_secret: str = ""
+    vercel_webhook_secret: str = ""
 
     # Encryption
     token_encryption_key: str

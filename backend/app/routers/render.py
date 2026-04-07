@@ -107,7 +107,7 @@ async def get_deploy_logs(service_id: str, deploy_id: str, user_id: str = Depend
     """Fetch log lines for a Render deploy using the unified logs endpoint."""
     token = _get_render_token(user_id)
 
-    # First fetch the deploy to get its time window
+    # First fetch the deploy and service to get time window + ownerId
     async with httpx.AsyncClient(timeout=30.0) as client:
         deploy_resp = await client.get(
             f"{RENDER_API}/services/{service_id}/deploys/{deploy_id}",
@@ -120,7 +120,15 @@ async def get_deploy_logs(service_id: str, deploy_id: str, user_id: str = Depend
         start = deploy.get("createdAt")
         end = deploy.get("finishedAt")
 
+        svc_resp = await client.get(
+            f"{RENDER_API}/services/{service_id}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+        owner_id = svc_resp.json().get("service", svc_resp.json()).get("ownerId") if svc_resp.status_code == 200 else None
+
         params: dict = {"resource": service_id, "limit": 200}
+        if owner_id:
+            params["ownerId"] = owner_id
         if start:
             params["startTime"] = start
         if end:
