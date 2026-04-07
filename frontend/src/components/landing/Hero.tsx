@@ -20,7 +20,9 @@ function HeroContent() {
   const handleSignIn = async () => {
     await supabase.auth.signInWithOAuth({
       provider: "github",
-      options: { redirectTo: `${window.location.origin}/auth/callback` },
+      options: {
+        redirectTo: `${process.env.NEXT_PUBLIC_FRONTEND_URL}/auth/callback`,
+      },
     });
   };
 

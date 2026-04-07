@@ -19,26 +19,41 @@ export function Nav() {
   const handleSignIn = async () => {
     await supabase.auth.signInWithOAuth({
       provider: "github",
-      options: { redirectTo: `${window.location.origin}/auth/callback` },
+      options: {
+        redirectTo: `${process.env.NEXT_PUBLIC_FRONTEND_URL}/auth/callback`,
+      },
     });
   };
 
   return (
     <nav className="sticky top-0 z-50 bg-white/90 backdrop-blur-xl border-b border-black/5">
       <div className="max-w-7xl mx-auto px-12 py-5 flex justify-between items-center">
-        <a href="/" className="flex items-center gap-3 hover:opacity-80 transition-opacity">
+        <a
+          href="/"
+          className="flex items-center gap-3 hover:opacity-80 transition-opacity"
+        >
           <VantageIcon size={38} />
           <div>
-            <div className="text-[18px] font-semibold text-[#0f172a] leading-tight">Vantage</div>
-            <div className="text-[11px] text-brand-purple font-medium">DevOps Hub</div>
+            <div className="text-[18px] font-semibold text-[#0f172a] leading-tight">
+              Vantage
+            </div>
+            <div className="text-[11px] text-brand-purple font-medium">
+              DevOps Hub
+            </div>
           </div>
         </a>
 
         <div className="flex gap-10 items-center">
-          <a href="#features" className="text-[15px] text-[#64748b] hover:text-[#0f172a] transition-colors">
+          <a
+            href="#features"
+            className="text-[15px] text-[#64748b] hover:text-[#0f172a] transition-colors"
+          >
             Features
           </a>
-          <a href="#integrations" className="text-[15px] text-[#64748b] hover:text-[#0f172a] transition-colors">
+          <a
+            href="#integrations"
+            className="text-[15px] text-[#64748b] hover:text-[#0f172a] transition-colors"
+          >
             Integrations
           </a>
           {authed ? (
