@@ -64,6 +64,7 @@ export interface PullRequest {
 
 export interface DeployAnalysis { error_lines: string[]; reason: string; fix: string; }
 export interface Investigation { service: string; error: string; root_cause: string; fix: string; key_logs: string[]; }
+export interface RuntimeError { id: string; title: string; subtitle: string; timestamp: string; metadata: { errors?: string[] } | null; }
 export interface UptimeStatus { is_up: boolean; latency_ms: number; status_code: number | null; uptime_pct: number | null; avg_latency_ms: number | null; checks: { is_up: boolean; latency_ms: number; checked_at: string }[]; }
 export interface EnvVar { key: string; target: string[]; type: string; git_branch?: string; }
 export interface LogLine { type: "stdout" | "stderr" | "command"; text: string; }

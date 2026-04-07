@@ -1,3 +1,6 @@
+import asyncio
+from datetime import datetime, timezone, timedelta
+
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -158,6 +161,54 @@ async def get_deploy_logs(service_id: str, deploy_id: str, user_id: str = Depend
         lines.append({"type": line_type, "text": text})
 
     return {"lines": lines}
+
+
+@router.get("/metrics/{service_id}")
+async def get_service_metrics(service_id: str, user_id: str = Depends(get_user_id)):
+    """Fetch CPU, memory, and HTTP request metrics for a Render service (last 60 min)."""
+    token = _get_render_token(user_id)
+
+    now = datetime.now(timezone.utc)
+    params = {
+        "resource": service_id,
+        "startTime": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "resolutionSeconds": 60,
+    }
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        cpu_resp, mem_resp, req_resp = await asyncio.gather(
+            client.get(f"{RENDER_API}/metrics/cpu", headers=headers, params=params),
+            client.get(f"{RENDER_API}/metrics/memory", headers=headers, params=params),
+            client.get(f"{RENDER_API}/metrics/http-requests", headers=headers, params={**params, "aggregateBy": "statusCode"}),
+            return_exceptions=True,
+        )
+
+    def _parse_series(resp) -> list[dict]:
+        if isinstance(resp, Exception) or resp.status_code != 200:
+            return []
+        data = resp.json()
+        if not isinstance(data, list) or not data:
+            return []
+        return [{"t": v["timestamp"], "v": v["value"]} for v in data[0].get("values", [])]
+
+    def _parse_http(resp) -> dict[str, list[dict]]:
+        if isinstance(resp, Exception) or resp.status_code != 200:
+            return {}
+        data = resp.json()
+        result: dict[str, list[dict]] = {}
+        for series in (data if isinstance(data, list) else []):
+            labels = {l["field"]: l["value"] for l in series.get("labels", [])}
+            code = labels.get("statusCode", "other")
+            result[code] = [{"t": v["timestamp"], "v": v["value"]} for v in series.get("values", [])]
+        return result
+
+    return {
+        "cpu": _parse_series(cpu_resp),
+        "memory": _parse_series(mem_resp),
+        "http_by_status": _parse_http(req_resp),
+    }
 
 
 class TriggerDeployRequest(BaseModel):

@@ -13,11 +13,17 @@ interface Event {
   id: string;
   type: EventType;
   service: ServiceType;
+  project_id?: string;
   title: string;
   subtitle: string;
   status: EventStatus;
   timestamp: string;
   url: string;
+}
+
+interface Project {
+  id: string;
+  name: string;
 }
 
 // ── Icons ──────────────────────────────────────────────────────────────────
@@ -107,114 +113,98 @@ function timeAgo(iso: string): string {
   return `${days}d ago`;
 }
 
-// ── Main component ─────────────────────────────────────────────────────────
+const ALERT_STATUSES = new Set(["error", "warning"]);
 
-const FILTERS = ["All", "vercel", "github", "render", "supabase"] as const;
-type Filter = (typeof FILTERS)[number];
+// ── Main component ─────────────────────────────────────────────────────────
 
 export default function EventsPage() {
   const [events, setEvents] = useState<Event[]>([]);
   const [connected, setConnected] = useState<string[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
-  const [filter, setFilter] = useState<Filter>("All");
+  const [tab, setTab] = useState<"alerts" | "all">("alerts");
+  const [projectFilter, setProjectFilter] = useState<string>("All");
 
-  useEffect(() => {
+  const fetchEvents = () =>
     apiFetch("/api/events")
-      .then((res) => res.json())
+      .then((r) => r.json())
       .then((data) => {
         setEvents(data.events ?? []);
         setConnected(data.connected ?? []);
+        setProjects(data.projects ?? []);
       })
-      .catch(() => {})
-      .finally(() => setLoading(false));
+      .catch(() => {});
 
-    // Realtime: update events list when new rows land in the events table
+  useEffect(() => {
+    fetchEvents().finally(() => setLoading(false));
+
     const supabase = createClient();
     const channel = supabase
       .channel("events-feed")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "events" },
-        (payload) => {
-          if (payload.eventType === "INSERT" || payload.eventType === "UPDATE") {
-            const row = payload.new as Record<string, unknown>;
-            const eventTypeRaw = (row.event_type as string) ?? "";
-            const typeMap: Record<string, string> = {
-              "deployment.created": "deployment",
-              "deployment.succeeded": "deployment",
-              "deployment.ready": "deployment",
-              "deployment.error": "deployment",
-              "deployment.canceled": "deployment",
-              deploy: "deploy",
-              commit: "commit",
-              pull_request: "pull_request",
-              ci_run: "ci_run",
-            };
-            const incoming: Event = {
-              id: (row.external_id as string) || (row.id as string),
-              type: (typeMap[eventTypeRaw] ?? eventTypeRaw) as EventType,
-              service: (row.service_type as ServiceType) ?? "vercel",
-              title: (row.title as string) ?? "",
-              subtitle: (row.subtitle as string) ?? "",
-              status: (row.status as EventStatus) ?? "building",
-              timestamp: (row.occurred_at as string) ?? "",
-              url: (row.external_url as string) ?? "",
-            };
-            setEvents((prev) => {
-              const idx = prev.findIndex((e) => e.id === incoming.id);
-              if (idx !== -1) {
-                const next = [...prev];
-                next[idx] = incoming;
-                return next;
-              }
-              return [incoming, ...prev];
-            });
-          }
-        }
-      )
+      .on("postgres_changes", { event: "*", schema: "public", table: "events" }, fetchEvents)
       .subscribe();
 
     return () => { supabase.removeChannel(channel); };
   }, []);
 
-  const visible = filter === "All" ? events : events.filter((e) => e.service === filter);
-
-  const filterLabel: Record<string, string> = {
-    vercel: "Vercel",
-    github: "GitHub",
-    render: "Render",
-    supabase: "Supabase",
-  };
-
-  const availableFilters: Filter[] = ["All", ...connected.filter((s) => FILTERS.includes(s as Filter))] as Filter[];
+  const byProject = projectFilter === "All" ? events : events.filter((e) => e.project_id === projectFilter);
+  const visible = tab === "alerts" ? byProject.filter((e) => ALERT_STATUSES.has(e.status)) : byProject;
+  const alertCount = events.filter((e) => ALERT_STATUSES.has(e.status)).length;
 
   return (
     <>
       <div className="mb-6">
-        <h1 className="text-[26px] font-medium text-white/95 tracking-tight mb-1.5">
-          Events
-        </h1>
-        <p className="text-sm text-white/75">
-          Unified activity feed across all connected services
-        </p>
+        <div className="flex items-start justify-between">
+          <div>
+            <h1 className="text-[26px] font-medium text-white/95 tracking-tight mb-1.5">Events</h1>
+            <p className="text-sm text-white/75">Runtime alerts and activity across all connected services</p>
+          </div>
+          {alertCount > 0 && (
+            <span className="flex items-center gap-1.5 px-3 py-1.5 bg-red-500/20 border border-red-400/30 rounded-full text-[12px] font-semibold text-red-300">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" />
+              {alertCount} active alert{alertCount !== 1 ? "s" : ""}
+            </span>
+          )}
+        </div>
       </div>
 
-      {/* Filter bar */}
-      <div className="flex items-center gap-2 mb-5">
-        {availableFilters.map((f) => (
+      {/* Tabs */}
+      <div className="flex items-center gap-1 mb-4 bg-white/10 rounded-button p-1 w-fit">
+        {([["alerts", "Alerts"], ["all", "All Activity"]] as const).map(([key, label]) => (
           <button
-            key={f}
-            onClick={() => setFilter(f)}
-            className={`px-3 py-1.5 rounded-button text-[12px] font-medium transition-colors capitalize ${
-              filter === f
-                ? "bg-white text-brand-purple shadow-sm"
-                : "bg-white/30 text-white/80 hover:bg-white/40"
+            key={key}
+            onClick={() => setTab(key)}
+            className={`px-4 py-1.5 rounded-md text-[12px] font-medium transition-colors ${
+              tab === key ? "bg-white text-brand-purple shadow-sm" : "text-white/70 hover:text-white"
             }`}
           >
-            {f === "All" ? "All" : filterLabel[f] ?? f}
+            {label}
+            {key === "alerts" && alertCount > 0 && (
+              <span className="ml-1.5 px-1.5 py-0.5 bg-red-500 text-white rounded-full text-[10px] font-bold">{alertCount}</span>
+            )}
           </button>
         ))}
       </div>
+
+      {/* Project filter */}
+      {projects.length > 1 && (
+        <div className="flex items-center gap-2 mb-4 flex-wrap">
+          {[{ id: "All", name: "All Projects" }, ...projects].map((p) => (
+            <button
+              key={p.id}
+              onClick={() => setProjectFilter(p.id)}
+              className={`px-3 py-1.5 rounded-button text-[12px] font-medium transition-colors ${
+                projectFilter === p.id
+                  ? "bg-white text-brand-purple shadow-sm"
+                  : "bg-white/20 text-white/70 hover:bg-white/30"
+              }`}
+            >
+              {p.name}
+            </button>
+          ))}
+        </div>
+      )}
+
 
       <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
         {loading ? (
@@ -233,18 +223,22 @@ export default function EventsPage() {
           </div>
         ) : visible.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-16 px-6 text-center">
-            <div className="w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center mb-3">
-              <svg className="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-              </svg>
+            <div className={`w-10 h-10 rounded-full flex items-center justify-center mb-3 ${tab === "alerts" && connected.length > 0 ? "bg-emerald-50" : "bg-gray-100"}`}>
+              {tab === "alerts" && connected.length > 0 ? (
+                <svg className="w-5 h-5 text-emerald-500" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+              ) : (
+                <svg className="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12" /></svg>
+              )}
             </div>
             <p className="text-sm font-medium text-gray-700 mb-1">
-              {connected.length === 0 ? "No services connected" : "No events yet"}
+              {connected.length === 0 ? "No services connected" : tab === "alerts" ? "All clear" : "No activity yet"}
             </p>
             <p className="text-xs text-gray-400 max-w-xs">
               {connected.length === 0
                 ? "Connect a service on the Services page to start seeing activity."
-                : "Events will appear here as your connected services send activity."}
+                : tab === "alerts"
+                ? "No errors or warnings detected across your connected services."
+                : "Activity will appear here as your connected services send events."}
             </p>
           </div>
         ) : (
@@ -302,7 +296,7 @@ export default function EventsPage() {
       {!loading && visible.length > 0 && (
         <p className="text-xs text-white/50 mt-3 text-center">
           Showing {visible.length} event{visible.length !== 1 ? "s" : ""}
-          {filter !== "All" ? ` from ${filterLabel[filter] ?? filter}` : ""}
+          {projectFilter !== "All" ? ` from ${projects.find((p) => p.id === projectFilter)?.name ?? projectFilter}` : ""}
         </p>
       )}
     </>

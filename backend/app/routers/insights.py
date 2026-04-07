@@ -443,6 +443,23 @@ async def investigate_failure(request: Request, body: InvestigateRequest, user_i
                         for e in (entries if isinstance(entries, list) else [])
                         if (e.get("message") or e.get("text") or "").strip()
                     ]
+
+                # Also pull recent runtime_error events from DB (from log scanning)
+                rt_result = supabase.table("events") \
+                    .select("title, subtitle, metadata, occurred_at") \
+                    .eq("user_id", user_id) \
+                    .eq("service_type", "render") \
+                    .eq("event_type", "runtime_error") \
+                    .order("occurred_at", desc=True) \
+                    .limit(5) \
+                    .execute()
+                for evt in (rt_result.data or []):
+                    meta = evt.get("metadata") or {}
+                    errors = meta.get("errors", [])
+                    if errors:
+                        context_lines.insert(0, f"[Runtime error at {evt.get('occurred_at', '')}]")
+                        context_lines[1:1] = [str(e)[:200] for e in errors[:5]]
+
             except Exception as e:
                 logger.exception("Error in Render investigate: %s", e)
 

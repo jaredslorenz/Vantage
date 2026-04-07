@@ -10,7 +10,7 @@ import type {
   Project, ProjectService, Deployment, Commit, PullRequest,
   RenderDeploy, VercelProject, GitHubRepo, RenderService,
   SupabaseProject, SupabaseServiceHealth, SupabaseOverview,
-  DeployAnalysis, UptimeStatus, EnvVar, LogLine, Investigation,
+  DeployAnalysis, UptimeStatus, EnvVar, LogLine, Investigation, RuntimeError,
 } from "@/types/project";
 import { InsightPanel } from "@/components/project/InsightPanel";
 import { BuildTrendChart } from "@/components/project/BuildTrendChart";
@@ -18,6 +18,7 @@ import { DORAMetrics } from "@/components/project/DORAMetrics";
 import { DeploymentRow } from "@/components/project/DeploymentRow";
 import { VercelCard } from "@/components/project/VercelCard";
 import { RenderCard, RenderDeployRow } from "@/components/project/RenderCard";
+import { RenderMetricsChart } from "@/components/project/RenderMetricsChart";
 import { GitHubCard, CommitRow, PRRow } from "@/components/project/GitHubCard";
 import { SupabaseCard, SB_COLOR } from "@/components/project/SupabaseCard";
 
@@ -194,6 +195,7 @@ export default function ProjectPage() {
   const [proactiveAlerts, setProactiveAlerts] = useState<Record<string, DeployAnalysis>>({});
   const [investigation, setInvestigation] = useState<Investigation | null>(null);
   const [investigating, setInvestigating] = useState(false);
+  const [runtimeErrors, setRuntimeErrors] = useState<RuntimeError[]>([]);
   const prevVercelStates = useRef<Record<string, string>>({});
   const prevRenderStates = useRef<Record<string, string>>({});
   const autoInvestigated = useRef(false);
@@ -232,6 +234,10 @@ export default function ProjectPage() {
           fetches.push(
             apiFetch(`/api/render/deploys?serviceId=${renderSvc.resource_id}&limit=20`)
               .then((r) => r.json()).then((d) => setRenderDeploys(d.deploys ?? [])).catch(() => {})
+          );
+          fetches.push(
+            apiFetch(`/api/events?event_type=runtime_error&project_id=${p.id}&limit=20`)
+              .then((r) => r.json()).then((d) => setRuntimeErrors(d.events ?? [])).catch(() => {})
           );
         }
         if (supabaseSvc) {
@@ -971,6 +977,38 @@ export default function ProjectPage() {
                       ts: new Date(d.created_at).getTime(),
                     }))} />
                   </div>
+                  {/* Metrics card */}
+                  <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card p-4 mb-3">
+                    <RenderMetricsChart serviceId={activeService.resource_id} />
+                  </div>
+                  {/* Runtime errors */}
+                  {runtimeErrors.length > 0 && (
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-red-200/60 rounded-card shadow-card overflow-hidden divide-y divide-red-50 mb-3">
+                      <div className="px-5 py-2.5 border-b border-red-100 flex items-center gap-2">
+                        <span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" />
+                        <span className="text-[11px] font-semibold text-red-700">Runtime Errors</span>
+                        <span className="ml-auto text-[10px] text-red-400">{runtimeErrors.length} detected</span>
+                      </div>
+                      {runtimeErrors.slice(0, 5).map((err) => (
+                        <div key={err.id} className="px-5 py-3">
+                          <div className="flex items-start justify-between gap-3 mb-1.5">
+                            <span className="text-[12px] font-medium text-gray-800 truncate">{err.subtitle || err.title}</span>
+                            <span className="text-[10px] text-gray-400 whitespace-nowrap shrink-0">
+                              {new Date(err.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                            </span>
+                          </div>
+                          {err.metadata?.errors && err.metadata.errors.length > 1 && (
+                            <div className="mt-1.5 bg-red-50 rounded px-2.5 py-2 font-mono text-[10px] text-red-600 space-y-0.5">
+                              {err.metadata.errors.slice(0, 3).map((line, i) => (
+                                <div key={i} className="truncate">{line}</div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
                   {/* Deploy history card */}
                   <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100">
                     <div className="px-5 py-2.5 border-b border-gray-100">
