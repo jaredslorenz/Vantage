@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from app.core.encryption import encrypt_token, decrypt_token
 from app.core.security import get_user_id
 from app.core.supabase import supabase
+from app.core import token_cache
 
 GITHUB_API = "https://api.github.com"
 
@@ -12,17 +13,20 @@ router = APIRouter(prefix="/api/github", tags=["github"])
 
 def _get_github_token(user_id: str) -> str:
     """Returns the stored PAT for the user, or raises."""
+    cached = token_cache.get(user_id, "github")
+    if cached:
+        return cached
     result = supabase.table("connected_services") \
         .select("api_token") \
         .eq("user_id", user_id) \
         .eq("service_type", "github") \
         .single() \
         .execute()
-
     if not result.data or not result.data.get("api_token"):
         raise HTTPException(status_code=404, detail="GitHub not connected")
-
-    return decrypt_token(result.data["api_token"])
+    token = decrypt_token(result.data["api_token"])
+    token_cache.set(user_id, "github", token)
+    return token
 
 
 class ConnectRequest(BaseModel):
@@ -57,6 +61,7 @@ async def connect_github(body: ConnectRequest, user_id: str = Depends(get_user_i
         "is_active": True,
         "health_status": "healthy",
     }, on_conflict="user_id,service_type,service_id").execute()
+    token_cache.invalidate(user_id, "github")
 
     return {"status": "connected", "username": github_username}
 

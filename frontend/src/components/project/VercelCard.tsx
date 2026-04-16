@@ -4,23 +4,24 @@ import { timeAgo } from "@/lib/utils";
 import type { Deployment, ProjectService, UptimeStatus } from "@/types/project";
 import { StatusDot, STATE_COLOR, STATE_LABEL } from "@/components/project/StatusDot";
 
-export function VercelCard({ service, deployments, selected, onClick, onUnlink, uptime, onInvestigate }: {
+export function VercelCard({ service, deployments, selected, onClick, onUnlink, uptime, onInvestigate, hasRuntimeErrors }: {
   service: ProjectService; deployments: Deployment[]; selected: boolean; onClick: () => void; onUnlink: () => void;
-  uptime?: UptimeStatus; onInvestigate?: () => void;
+  uptime?: UptimeStatus; onInvestigate?: () => void; hasRuntimeErrors?: boolean;
 }) {
   const latest = deployments[0];
   const readyCount = deployments.filter((d) => d.state === "READY").length;
   const successRate = deployments.length ? Math.round((readyCount / deployments.length) * 100) : null;
   const weekFails = deployments.filter((d) => d.state === "ERROR" && Date.now() - d.created_at < 7 * 86400000).length;
   const hasIssue = successRate !== null && successRate < 50 && deployments.length >= 3 && latest?.state === "ERROR";
+  const hasAnyError = hasIssue || hasRuntimeErrors || latest?.state === "ERROR";
 
   return (
     <div
       onClick={onClick}
-      className={`group relative w-full cursor-pointer rounded-card p-5 shadow-card transition-all duration-300 overflow-hidden
+      className={`group relative w-full cursor-pointer rounded-card p-5 shadow-card transition-all duration-300 overflow-hidden flex flex-col
         ${selected
           ? "bg-white border-2 border-brand-purple shadow-[0_0_0_4px_rgba(111,123,247,0.12)]"
-          : hasIssue
+          : hasAnyError
           ? "bg-linear-to-br from-red-50/80 to-white/95 border border-red-300 shadow-[0_0_0_4px_rgba(239,68,68,0.10)] hover:shadow-[0_0_0_4px_rgba(239,68,68,0.18)]"
           : "bg-white/95 border border-white/60 hover:border-brand-purple/50 hover:shadow-xl hover:-translate-y-0.5"
         }`}
@@ -57,15 +58,15 @@ export function VercelCard({ service, deployments, selected, onClick, onUnlink, 
           </button>
         </div>
       </div>
-      <div className="grid grid-cols-3 gap-2 mb-4">
+      <div className="grid grid-cols-3 gap-2 mb-3">
         {[
           { label: "Deploys", value: String(deployments.length) },
           { label: "Success", value: successRate !== null ? `${successRate}%` : "—" },
           { label: "Last", value: latest ? timeAgo(latest.created_at) : "—" },
-        ].map((stat) => (
-          <div key={stat.label} className="bg-gray-50 rounded-lg px-2.5 py-2 text-center">
-            <div className="text-[15px] font-bold text-gray-900">{stat.value}</div>
-            <div className="text-[9px] uppercase tracking-wider text-gray-400 mt-0.5">{stat.label}</div>
+        ].map((s) => (
+          <div key={s.label} className="bg-gray-50 rounded-lg px-2.5 py-2 text-center">
+            <div className="text-[15px] font-bold text-gray-900">{s.value}</div>
+            <div className="text-[9px] uppercase tracking-wider text-gray-400 mt-0.5">{s.label}</div>
           </div>
         ))}
       </div>
@@ -92,7 +93,7 @@ export function VercelCard({ service, deployments, selected, onClick, onUnlink, 
         </div>
       )}
       {uptime && (
-        <div className="flex items-center gap-2 mt-2.5 pt-2.5 border-t border-gray-100">
+        <div className="flex-1 flex items-center gap-2 mt-3 border-t border-gray-100 py-3">
           <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${uptime.is_up ? "bg-emerald-400" : "bg-red-400"}`} />
           <span className={`text-[10px] font-medium ${uptime.is_up ? "text-emerald-600" : "text-red-500"}`}>
             {uptime.is_up ? "Online" : "Down"}
@@ -103,7 +104,7 @@ export function VercelCard({ service, deployments, selected, onClick, onUnlink, 
           )}
         </div>
       )}
-      <div className="flex items-center justify-between mt-3">
+      <div className="flex items-center justify-between mt-auto pt-3 border-t border-gray-100">
         <a
           href={latest?.team_slug ? `https://vercel.com/${latest.team_slug}/${latest.name || service.resource_name}` : "https://vercel.com/dashboard"}
           target="_blank"
@@ -113,7 +114,7 @@ export function VercelCard({ service, deployments, selected, onClick, onUnlink, 
         >
           Open in Vercel ↗
         </a>
-        {hasIssue && onInvestigate ? (
+        {hasAnyError && onInvestigate ? (
           <button
             onClick={(e) => { e.stopPropagation(); onInvestigate(); }}
             className="text-[11px] font-semibold px-3 py-1.5 rounded-button bg-red-500 text-white hover:bg-red-600 transition-colors shadow-sm"

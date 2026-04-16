@@ -24,7 +24,7 @@ export function fmtMTTR(mins: number): string {
   return `${Math.round(mins / 1440)}d`;
 }
 
-export function DORAMetrics({ deployments }: { deployments: Deployment[] }) {
+export function DORAMetrics({ deployments, inline }: { deployments: Deployment[]; inline?: boolean }) {
   if (deployments.length < 3) return null;
 
   // Deployment frequency — deploys in last 30 days / 30
@@ -61,8 +61,8 @@ export function DORAMetrics({ deployments }: { deployments: Deployment[] }) {
     { label: "MTTR",          value: mttr != null ? fmtMTTR(mttr) : "—", tier: mttr != null ? doraTier("mttr", mttr) : null, tooltip: "Avg time from failure to recovery" },
   ];
 
-  return (
-    <div className="flex items-center gap-1.5 px-5 py-2 bg-gray-50/60">
+  const content = (
+    <div className="flex items-center gap-1.5">
       <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mr-1">DORA</span>
       {stats.map((s, i) => (
         <div key={s.label} className="group relative flex items-center gap-1.5">
@@ -79,4 +79,7 @@ export function DORAMetrics({ deployments }: { deployments: Deployment[] }) {
       ))}
     </div>
   );
+
+  if (inline) return content;
+  return <div className="px-5 py-2 bg-gray-50/60">{content}</div>;
 }

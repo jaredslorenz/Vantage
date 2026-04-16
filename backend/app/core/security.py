@@ -9,7 +9,6 @@ bearer_scheme = HTTPBearer()
 
 jwks_client = PyJWKClient(f"{settings.supabase_url}/auth/v1/.well-known/jwks.json")
 
-
 def verify_supabase_jwt(token: str) -> dict:
     try:
         signing_key = jwks_client.get_signing_key_from_jwt(token)

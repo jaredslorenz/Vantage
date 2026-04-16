@@ -1,19 +1,35 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { apiFetch } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
-import type { Deployment, DeployAnalysis } from "@/types/project";
+import type { Deployment, DeployAnalysis, LighthouseScores } from "@/types/project";
 import { StatusDot, CopyButton, STATE_COLOR, STATE_LABEL, STATE_BG } from "@/components/project/StatusDot";
 
-export function DeploymentRow({ deployment, index, maxBuildDuration, onRedeploy, onViewLogs, logsHref, githubRepo, initialAnalysis }: {
+function scoreColor(score: number | null) {
+  if (score == null) return "text-gray-400 bg-gray-100";
+  if (score >= 90) return "text-emerald-700 bg-emerald-50";
+  if (score >= 50) return "text-amber-700 bg-amber-50";
+  return "text-red-600 bg-red-50";
+}
+
+export function DeploymentRow({ deployment, index, maxBuildDuration, onRedeploy, onViewLogs, githubRepo, initialAnalysis }: {
   deployment: Deployment; index: number; maxBuildDuration: number;
   onRedeploy: (id: string) => void; onViewLogs?: (id: string, name: string) => void;
-  logsHref?: string; githubRepo?: string; initialAnalysis?: DeployAnalysis;
+  githubRepo?: string; initialAnalysis?: DeployAnalysis;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [analysis, setAnalysis] = useState<DeployAnalysis | null>(initialAnalysis ?? null);
   const [analyzing, setAnalyzing] = useState(false);
+  const [lighthouse, setLighthouse] = useState<LighthouseScores | null>(null);
+
+  useEffect(() => {
+    if (!expanded || lighthouse !== null) return;
+    apiFetch(`/api/vercel/deployments/${deployment.id}/checks`)
+      .then((r) => r.json())
+      .then((d) => { if (d.lighthouse) setLighthouse(d.lighthouse); })
+      .catch(() => {});
+  }, [expanded]);
 
   const analyzeFailure = async () => {
     setAnalyzing(true);
@@ -109,18 +125,16 @@ export function DeploymentRow({ deployment, index, maxBuildDuration, onRedeploy,
                 Open deployment ↗
               </a>
             )}
-            {logsHref && (
-              <a
-                href={logsHref}
-                target="_blank"
-                rel="noopener noreferrer"
+            {onViewLogs && (
+              <button
+                onClick={() => onViewLogs(deployment.id, deployment.name)}
                 className="text-[12px] font-medium px-3.5 py-1.5 rounded-button border border-gray-200 text-gray-600 hover:border-brand-purple hover:text-brand-purple transition-colors flex items-center gap-1.5"
               >
                 <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                   <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
                 </svg>
-                View logs ↗
-              </a>
+                View logs
+              </button>
             )}
             {deployment.state === "ERROR" && !analysis && (
               <button
@@ -148,6 +162,22 @@ export function DeploymentRow({ deployment, index, maxBuildDuration, onRedeploy,
               Redeploy this
             </button>
           </div>
+
+          {lighthouse && (
+            <div className="mt-3 flex items-center gap-2 flex-wrap">
+              <span className="text-[10px] text-gray-400 uppercase tracking-wider mr-1">Lighthouse</span>
+              {([
+                { label: "Perf", value: lighthouse.performance },
+                { label: "A11y", value: lighthouse.accessibility },
+                { label: "SEO", value: lighthouse.seo },
+                { label: "BP", value: lighthouse.best_practices },
+              ] as { label: string; value: number | null }[]).map((s) => (
+                <span key={s.label} className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${scoreColor(s.value)}`}>
+                  {s.label} {s.value ?? "—"}
+                </span>
+              ))}
+            </div>
+          )}
 
           {analysis && (
             <div className="mt-4 rounded-lg border border-red-100 bg-red-50/40 p-3.5 animate-fade-in space-y-2.5">

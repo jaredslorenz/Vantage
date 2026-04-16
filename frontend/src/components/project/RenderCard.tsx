@@ -7,24 +7,25 @@ import type { RenderDeploy, ProjectService } from "@/types/project";
 import { RENDER_COLOR, RENDER_LABEL, RENDER_BG, CopyButton } from "@/components/project/StatusDot";
 
 // --- Render card ---
-export function RenderCard({ service, deploys, selected, onClick, onUnlink, onInvestigate }: {
+export function RenderCard({ service, deploys, selected, onClick, onUnlink, onInvestigate, hasRuntimeErrors, uptime }: {
   service: ProjectService; deploys: RenderDeploy[]; selected: boolean; onClick: () => void; onUnlink: () => void;
-  onInvestigate?: () => void;
+  onInvestigate?: () => void; hasRuntimeErrors?: boolean; uptime?: import("@/types/project").UptimeStatus;
 }) {
   const latest = deploys[0];
-  const liveCount = deploys.filter((d) => d.status === "live").length;
+  const liveCount = deploys.filter((d) => d.status === "live" || d.status === "deactivated").length;
   const successRate = deploys.length ? Math.round((liveCount / deploys.length) * 100) : null;
   const isBuilding = latest?.status === "build_in_progress" || latest?.status === "update_in_progress";
   const weekFails = deploys.filter((d) => d.status === "build_failed" && Date.now() - new Date(d.created_at).getTime() < 7 * 86400000).length;
   const hasIssue = successRate !== null && successRate < 50 && deploys.length >= 3 && latest?.status === "build_failed";
+  const hasAnyError = hasIssue || hasRuntimeErrors || latest?.status === "build_failed";
 
   return (
     <div
       onClick={onClick}
-      className={`group relative w-full cursor-pointer rounded-card p-5 shadow-card transition-all duration-300 overflow-hidden
+      className={`group relative w-full cursor-pointer rounded-card p-5 shadow-card transition-all duration-300 overflow-hidden flex flex-col
         ${selected
           ? "bg-white border-2 border-brand-purple shadow-[0_0_0_4px_rgba(111,123,247,0.12)]"
-          : hasIssue
+          : hasAnyError
           ? "bg-linear-to-br from-red-50/80 to-white/95 border border-red-300 shadow-[0_0_0_4px_rgba(239,68,68,0.10)] hover:shadow-[0_0_0_4px_rgba(239,68,68,0.18)]"
           : "bg-white/95 border border-white/60 hover:border-brand-purple/50 hover:shadow-xl hover:-translate-y-0.5"
         }`}
@@ -64,7 +65,7 @@ export function RenderCard({ service, deploys, selected, onClick, onUnlink, onIn
           </button>
         </div>
       </div>
-      <div className="grid grid-cols-3 gap-2 mb-4">
+      <div className="grid grid-cols-3 gap-2 mb-3">
         {[
           { label: "Deploys", value: String(deploys.length) },
           { label: "Success", value: successRate !== null ? `${successRate}%` : "—" },
@@ -98,7 +99,19 @@ export function RenderCard({ service, deploys, selected, onClick, onUnlink, onIn
           </div>
         </div>
       )}
-      <div className="flex items-center justify-between mt-3">
+      {uptime && (
+        <div className="flex-1 flex items-center gap-2 mt-3 border-t border-gray-100 py-3">
+          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${uptime.is_up ? "bg-emerald-400" : "bg-red-400"}`} />
+          <span className={`text-[10px] font-medium ${uptime.is_up ? "text-emerald-600" : "text-red-500"}`}>
+            {uptime.is_up ? "Online" : "Down"}
+          </span>
+          <span className="text-[10px] text-gray-400">{uptime.latency_ms}ms</span>
+          {uptime.uptime_pct != null && (
+            <span className="text-[10px] text-gray-400 ml-auto">{uptime.uptime_pct}% uptime</span>
+          )}
+        </div>
+      )}
+      <div className="flex items-center justify-between mt-auto pt-3 border-t border-gray-100">
         <a
           href={`https://dashboard.render.com/web/${service.resource_id}`}
           target="_blank"
@@ -129,14 +142,20 @@ export function RenderCard({ service, deploys, selected, onClick, onUnlink, onIn
 }
 
 // --- Render deploy row ---
-export function RenderDeployRow({ deploy, index, serviceId, onViewLogs, onRedeploy }: {
-  deploy: RenderDeploy; index: number; serviceId: string;
-  onViewLogs: (url: string, subtitle: string) => void;
-  onRedeploy: (serviceId: string) => void;
+export function RenderDeployRow({ deploy, index, serviceId, maxBuildDuration, onViewLogs, onRedeploy }: {
+  deploy: RenderDeploy; index: number; serviceId: string; maxBuildDuration?: number;
+  onViewLogs: (url: string, subtitle: string, isLive?: boolean) => void;
+  onRedeploy: (serviceId: string, commitId?: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const color = RENDER_COLOR[deploy.status] ?? "#d1d5db";
   const isBuilding = deploy.status === "build_in_progress" || deploy.status === "update_in_progress";
+  const duration = deploy.finished_at
+    ? Math.round((new Date(deploy.finished_at).getTime() - new Date(deploy.created_at).getTime()) / 1000)
+    : null;
+  const barPct = duration && maxBuildDuration
+    ? Math.max(8, Math.round((duration / maxBuildDuration) * 100))
+    : 0;
 
   return (
     <div className="animate-slide-up border-l-[3px] transition-all" style={{ borderLeftColor: color, animationDelay: `${index * 30}ms` }}>
@@ -155,6 +174,14 @@ export function RenderDeployRow({ deploy, index, serviceId, onViewLogs, onRedepl
           {deploy.commit_id && <div className="text-[11px] font-mono text-gray-400">{deploy.commit_id}</div>}
         </div>
         <div className="flex items-center gap-2 shrink-0">
+          {barPct > 0 && (
+            <div className="flex items-center gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+              <div className="w-14 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                <div className="h-full rounded-full transition-all" style={{ width: `${barPct}%`, background: color, opacity: 0.6 }} />
+              </div>
+              <span className="text-[10px] text-gray-400 tabular-nums font-mono">{duration}s</span>
+            </div>
+          )}
           <CopyButton text={deploy.id} />
           <span className="text-[11px] text-gray-400">{timeAgo(deploy.created_at)}</span>
           <svg className={`w-3.5 h-3.5 text-gray-300 transition-transform duration-200 ${expanded ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 9l-7 7-7-7" /></svg>
@@ -185,7 +212,11 @@ export function RenderDeployRow({ deploy, index, serviceId, onViewLogs, onRedepl
               Open deployment ↗
             </a>
             <button
-              onClick={() => onViewLogs(`/api/render/deploys/${serviceId}/${deploy.id}/logs`, deploy.commit_id ?? deploy.id)}
+              onClick={() => onViewLogs(
+                `/api/render/logs/${serviceId}/live?window=60`,
+                deploy.commit_id ?? deploy.id,
+                true,
+              )}
               className="text-[12px] font-medium px-3.5 py-1.5 rounded-button border border-gray-200 text-gray-600 hover:border-brand-purple hover:text-brand-purple transition-colors flex items-center gap-1.5"
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -193,11 +224,19 @@ export function RenderDeployRow({ deploy, index, serviceId, onViewLogs, onRedepl
               </svg>
               View logs
             </button>
+            {!isBuilding && deploy.commit_id && (
+              <button
+                onClick={() => onRedeploy(serviceId, deploy.commit_id!)}
+                className="text-[12px] font-medium px-3.5 py-1.5 rounded-button border border-gray-200 text-gray-600 hover:border-brand-purple hover:text-brand-purple transition-colors"
+              >
+                Rollback to this
+              </button>
+            )}
             <button
               onClick={() => onRedeploy(serviceId)}
               className="text-[12px] font-medium px-3.5 py-1.5 rounded-button border border-gray-200 text-gray-600 hover:border-brand-purple hover:text-brand-purple transition-colors"
             >
-              Redeploy this
+              Redeploy
             </button>
           </div>
         </div>

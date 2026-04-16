@@ -20,6 +20,7 @@ function fmt(v: number, unit: "cores" | "bytes"): string {
 function Sparkline({ data, color, unit }: { data: DataPoint[]; color: string; unit: "cores" | "bytes" }) {
   if (!data.length) return <div className="h-12 flex items-center justify-center text-[11px] text-gray-300">No data</div>;
   const max = Math.max(...data.map((d) => d.v), 1);
+  const min = Math.min(...data.map((d) => d.v), 0);
   const latest = data[data.length - 1]?.v ?? 0;
 
   return (
@@ -47,6 +48,7 @@ function Sparkline({ data, color, unit }: { data: DataPoint[]; color: string; un
           <Area type="monotone" dataKey="v" stroke={color} strokeWidth={1.5} fill={`url(#grad-${color.replace("#", "")})`} dot={false} />
         </AreaChart>
       </ResponsiveContainer>
+      <div className="text-[9px] font-mono text-gray-400 mt-1">{fmt(min, unit)} — {fmt(max, unit)}</div>
     </div>
   );
 }
@@ -79,7 +81,7 @@ export function RenderMetricsChart({ serviceId }: { serviceId: string }) {
 
   if (loading) {
     return (
-      <div className="grid grid-cols-3 gap-3 mt-4 animate-pulse">
+      <div className="grid grid-cols-3 gap-3 animate-pulse">
         {[0, 1, 2].map((i) => <div key={i} className="bg-gray-50 rounded-lg p-3 h-20" />)}
       </div>
     );
@@ -88,7 +90,7 @@ export function RenderMetricsChart({ serviceId }: { serviceId: string }) {
   if (!metrics) return null;
 
   return (
-    <div className="mt-4">
+    <div>
       <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Performance — last 60 min</div>
       <div className="grid grid-cols-3 gap-3">
         <div className="bg-gray-50 rounded-lg p-3">

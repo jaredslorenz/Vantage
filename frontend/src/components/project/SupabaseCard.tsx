@@ -28,7 +28,7 @@ export function SupabaseCard({ service, health, overview, selected, onClick, onU
   return (
     <div
       onClick={onClick}
-      className={`group relative w-full cursor-pointer rounded-card p-5 shadow-card transition-all duration-300 overflow-hidden
+      className={`group relative w-full cursor-pointer rounded-card p-5 shadow-card transition-all duration-300 overflow-hidden flex flex-col
         ${selected
           ? "bg-white border-2 border-brand-purple shadow-[0_0_0_4px_rgba(111,123,247,0.12)]"
           : hasIssue
@@ -101,7 +101,7 @@ export function SupabaseCard({ service, health, overview, selected, onClick, onU
           ))}
         </div>
       )}
-      <div className="flex items-center justify-between mt-3">
+      <div className="flex items-center justify-between mt-auto pt-3 border-t border-gray-100">
         <a
           href={`https://supabase.com/dashboard/project/${service.resource_id}`}
           target="_blank"

@@ -13,9 +13,18 @@ function fmtTs(ts: number): string {
 }
 
 function dotColor(status: string): string {
-  if (status === "READY" || status === "live") return "#34d399";
+  if (status === "READY" || status === "live" || status === "deactivated") return "#34d399";
   if (status === "ERROR" || status === "build_failed") return "#f87171";
+  if (status === "canceled" || status === "pre_deploy_failed") return "#d1d5db";
   return "#fbbf24";
+}
+
+function statusLabel(status: string): string {
+  if (status === "READY" || status === "live" || status === "deactivated") return "✓ ok";
+  if (status === "ERROR" || status === "build_failed") return "✗ fail";
+  if (status === "canceled") return "— canceled";
+  if (status === "pre_deploy_failed") return "✗ pre-deploy";
+  return "~ building";
 }
 
 export function BuildTrendChart({ items }: { items: ChartItem[] }) {
@@ -111,7 +120,7 @@ export function BuildTrendChart({ items }: { items: ChartItem[] }) {
 
         {/* Failure markers — vertical red line + label */}
         {items.map((it, i) => {
-          const isFail = it.status === "ERROR" || it.status === "build_failed";
+          const isFail = it.status === "ERROR" || it.status === "build_failed" || it.status === "pre_deploy_failed";
           if (!isFail) return null;
           return (
             <g key={`fail-${i}`}>
@@ -150,8 +159,8 @@ export function BuildTrendChart({ items }: { items: ChartItem[] }) {
           { val: rawMin, y: toY(rawMin) },
         ].map(({ val, y }) => (
           <g key={val} pointerEvents="none">
-            <rect x={0} y={y - 8} width={30} height={11} fill="white" fillOpacity="0.85" rx="2" />
-            <text x={4} y={y + 1} fill="#6b7280" fontSize="9" fontFamily="ui-monospace,monospace" dominantBaseline="middle">{val}s</text>
+            <rect x={0} y={y - 7} width={PAD_X - 4} height={11} fill="white" fillOpacity="0.9" rx="2" />
+            <text x={PAD_X - 14} y={y + 1} fill="#9ca3af" fontSize="9" fontFamily="ui-monospace,monospace" dominantBaseline="middle" textAnchor="end">{val}s</text>
           </g>
         ))}
 
@@ -163,7 +172,7 @@ export function BuildTrendChart({ items }: { items: ChartItem[] }) {
           return (
             <text key={i} x={x} y={PAD_TOP + CHART_H + 13} textAnchor={anchor}
               fill={hover === i ? "#6f7bf7" : "#9ca3af"} fontSize="9" fontFamily="system-ui,sans-serif">
-              {it.ts ? fmtTs(it.ts) : it.label}
+              {it.ts ? (i === 0 || i === n - 1 ? fmtTs(it.ts) : new Date(it.ts).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true }).replace(/ (AM|PM)/, (m) => m.trim().toLowerCase())) : it.label}
             </text>
           );
         })}
@@ -178,7 +187,7 @@ export function BuildTrendChart({ items }: { items: ChartItem[] }) {
               <rect x={tx} y={ty} width={tipW} height={tipH} rx="6" fill="#111827" opacity="0.93" />
               <text x={tx + 10} y={ly} fill="white" fontSize="11.5" fontWeight="700" fontFamily="ui-monospace,monospace">{item.duration}s</text>
               <text x={tx + tipW - 10} y={ly} textAnchor="end" fill={dotColor(item.status)} fontSize="10" fontWeight="600" fontFamily="system-ui,sans-serif">
-                {item.status === "READY" || item.status === "live" ? "✓ ok" : item.status === "ERROR" || item.status === "build_failed" ? "✗ fail" : "~ building"}
+                {statusLabel(item.status)}
               </text>
               {item.ts && <text x={tx + 10} y={ly += 14} fill="#9ca3af" fontSize="9.5" fontFamily="system-ui,sans-serif">{fmtTs(item.ts)}</text>}
               {item.commit && <text x={tx + 10} y={ly + 14} fill="#6b7280" fontSize="9" fontFamily="system-ui,sans-serif">{item.commit.length > 22 ? item.commit.slice(0, 22) + "…" : item.commit}</text>}

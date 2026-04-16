@@ -1,6 +1,7 @@
 import asyncio
 import re
 import json
+from datetime import datetime, timezone, timedelta
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -8,6 +9,7 @@ from app.core.logger import logger
 from app.core.encryption import encrypt_token, decrypt_token
 from app.core.security import get_user_id
 from app.core.supabase import supabase
+from app.core import token_cache
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
 
@@ -48,17 +50,20 @@ VERCEL_API = "https://api.vercel.com"
 
 def _get_vercel_token(user_id: str) -> str:
     """Returns the API token if set, otherwise raises."""
+    cached = token_cache.get(user_id, "vercel")
+    if cached:
+        return cached
     result = supabase.table("connected_services") \
         .select("api_token") \
         .eq("user_id", user_id) \
         .eq("service_type", "vercel") \
         .single() \
         .execute()
-
     if not result.data or not result.data.get("api_token"):
         raise HTTPException(status_code=404, detail="Vercel not connected")
-
-    return decrypt_token(result.data["api_token"])
+    token = decrypt_token(result.data["api_token"])
+    token_cache.set(user_id, "vercel", token)
+    return token
 
 router = APIRouter(prefix="/api/vercel", tags=["vercel"])
 
@@ -92,6 +97,7 @@ async def connect_vercel(body: ConnectRequest, user_id: str = Depends(get_user_i
         "is_active": True,
         "health_status": "healthy",
     }, on_conflict="user_id,service_type,service_id").execute()
+    token_cache.invalidate(user_id, "vercel")
 
     return {"status": "connected", "name": vercel_username}
 
@@ -347,3 +353,104 @@ async def get_vercel_deployments(
             })
 
     return {"deployments": deployments[:limit]}
+
+
+@router.get("/deployments/{deployment_id}/checks")
+async def get_deployment_checks(deployment_id: str, user_id: str = Depends(get_user_id)):
+    """Fetch deployment checks (e.g. Lighthouse scores) for a Vercel deployment."""
+    token = _get_vercel_token(user_id)
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"{VERCEL_API}/v1/deployments/{deployment_id}/checks",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    if resp.status_code != 200:
+        return {"checks": [], "lighthouse": None}
+
+    checks = resp.json().get("checks", resp.json() if isinstance(resp.json(), list) else [])
+    lighthouse = None
+
+    for check in (checks if isinstance(checks, list) else []):
+        name = (check.get("name") or "").lower()
+        if "lighthouse" not in name:
+            continue
+        metrics = (check.get("output") or {}).get("metrics") or {}
+        if not metrics:
+            continue
+        lighthouse = {
+            "performance": metrics.get("performance"),
+            "accessibility": metrics.get("accessibility"),
+            "seo": metrics.get("seo"),
+            "best_practices": metrics.get("bestPractices"),
+            "status": check.get("conclusion", check.get("status", "unknown")),
+        }
+        break
+
+    return {"checks": checks, "lighthouse": lighthouse}
+
+
+@router.get("/logs/{deployment_id}/runtime")
+async def get_runtime_logs(
+    deployment_id: str,
+    user_id: str = Depends(get_user_id),
+    projectId: str = Query(None),
+    window: int = Query(300, description="Only return logs from the last N seconds. Pass 0 for all logs."),
+):
+    """Fetch runtime logs for a Vercel deployment, optionally filtered to a recent time window."""
+    token = _get_vercel_token(user_id)
+
+    cutoff_ms = (datetime.now(timezone.utc).timestamp() - window) * 1000 if window > 0 else 0
+
+    url = (
+        f"{VERCEL_API}/v1/projects/{projectId}/deployments/{deployment_id}/runtime-logs"
+        if projectId
+        else f"{VERCEL_API}/v1/deployments/{deployment_id}/runtime-logs"
+    )
+
+    lines = []
+    async with httpx.AsyncClient() as client:
+        try:
+            async with client.stream(
+                "GET", url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=httpx.Timeout(connect=10.0, read=10.0, write=5.0, pool=5.0),
+            ) as stream:
+                if stream.status_code == 200:
+                    async for raw_line in stream.aiter_lines():
+                        raw_line = raw_line.strip()
+                        if not raw_line:
+                            continue
+                        try:
+                            entry = json.loads(raw_line)
+                            ts = entry.get("timestampInMs", 0)
+                            if cutoff_ms and ts and ts < cutoff_ms:
+                                continue
+                            text = _strip_ansi(entry.get("message") or entry.get("text") or "").strip()
+                            if not text:
+                                continue
+                            level = entry.get("level", "info")
+                            lines.append({
+                                "type": "stderr" if level == "error" else "stdout",
+                                "text": text,
+                                "timestamp": ts,
+                                "level": level,
+                                "request_path": entry.get("requestPath"),
+                                "status_code": entry.get("responseStatusCode"),
+                            })
+                        except json.JSONDecodeError:
+                            lines.append({"type": "stdout", "text": _strip_ansi(raw_line), "timestamp": 0})
+                elif stream.status_code == 404:
+                    raise HTTPException(status_code=404, detail="Deployment not found or no runtime logs available")
+                else:
+                    raise HTTPException(status_code=502, detail=f"Vercel returned {stream.status_code}")
+        except (httpx.ReadTimeout, asyncio.TimeoutError):
+            pass  # Return what we collected before timeout
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if not lines:
+                raise HTTPException(status_code=502, detail=f"Failed to fetch runtime logs: {exc}")
+
+    return {"lines": lines, "deployment_id": deployment_id}

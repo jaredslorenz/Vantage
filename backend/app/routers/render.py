@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from app.core.encryption import encrypt_token, decrypt_token
 from app.core.security import get_user_id
 from app.core.supabase import supabase
+from app.core import token_cache
 
 RENDER_API = "https://api.render.com/v1"
 
@@ -14,17 +15,20 @@ router = APIRouter(prefix="/api/render", tags=["render"])
 
 
 def _get_render_token(user_id: str) -> str:
+    cached = token_cache.get(user_id, "render")
+    if cached:
+        return cached
     result = supabase.table("connected_services") \
         .select("api_token") \
         .eq("user_id", user_id) \
         .eq("service_type", "render") \
         .single() \
         .execute()
-
     if not result.data or not result.data.get("api_token"):
         raise HTTPException(status_code=404, detail="Render not connected")
-
-    return decrypt_token(result.data["api_token"])
+    token = decrypt_token(result.data["api_token"])
+    token_cache.set(user_id, "render", token)
+    return token
 
 
 class ConnectRequest(BaseModel):
@@ -58,6 +62,7 @@ async def connect_render(body: ConnectRequest, user_id: str = Depends(get_user_i
         "is_active": True,
         "health_status": "healthy",
     }, on_conflict="user_id,service_type,service_id").execute()
+    token_cache.invalidate(user_id, "render")
 
     return {"status": "connected", "name": owner_name}
 
@@ -160,6 +165,63 @@ async def get_deploy_logs(service_id: str, deploy_id: str, user_id: str = Depend
         line_type = "stderr" if any(kw in text.lower() for kw in ("error", "err ", "failed", "exception", "fatal", "panic", "traceback")) else "stdout"
         lines.append({"type": line_type, "text": text})
 
+    # Fallback: if logs are gone (expired), check events table for stored error lines
+    if not lines:
+        try:
+            result = supabase.table("events") \
+                .select("metadata") \
+                .eq("user_id", user_id) \
+                .eq("external_id", deploy_id) \
+                .eq("event_type", "deploy") \
+                .limit(1) \
+                .execute()
+            if result.data:
+                stored = (result.data[0].get("metadata") or {}).get("error_lines", [])
+                lines = [{"type": "stderr", "text": t} for t in stored]
+        except Exception:
+            pass
+
+    return {"lines": lines}
+
+
+@router.get("/logs/{service_id}/live")
+async def get_live_logs(service_id: str, user_id: str = Depends(get_user_id), window: int = 30):
+    """Fetch the last `window` seconds of logs for a service (for live streaming)."""
+    token = _get_render_token(user_id)
+
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(seconds=window)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        svc_resp = await client.get(
+            f"{RENDER_API}/services/{service_id}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+        owner_id = svc_resp.json().get("service", svc_resp.json()).get("ownerId") if svc_resp.status_code == 200 else None
+
+        params: dict = {"resource": service_id, "limit": 200, "startTime": start}
+        if owner_id:
+            params["ownerId"] = owner_id
+
+        logs_resp = await client.get(
+            "https://api.render.com/v1/logs",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            params=params,
+        )
+
+    if logs_resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Render logs API returned {logs_resp.status_code}")
+
+    raw = logs_resp.json()
+    entries = raw.get("logs", raw) if isinstance(raw, dict) else raw
+    lines = []
+    for entry in (entries if isinstance(entries, list) else []):
+        text = (entry.get("message") or entry.get("text") or "").strip()
+        if not text:
+            continue
+        line_type = "stderr" if any(kw in text.lower() for kw in ("error", "err ", "failed", "exception", "fatal", "panic", "traceback")) else "stdout"
+        lines.append({"type": line_type, "text": text})
+
     return {"lines": lines}
 
 
@@ -214,14 +276,17 @@ async def get_service_metrics(service_id: str, user_id: str = Depends(get_user_i
 class TriggerDeployRequest(BaseModel):
     serviceId: str
     clearCache: bool = False
+    commitId: str | None = None
 
 
 @router.post("/deploy")
 async def trigger_deploy(body: TriggerDeployRequest, user_id: str = Depends(get_user_id)):
-    """Trigger a new deploy for a Render service."""
+    """Trigger a new deploy for a Render service. Pass commitId to roll back to a specific commit."""
     token = _get_render_token(user_id)
 
-    payload = {"clearCache": "clear"} if body.clearCache else {}
+    payload: dict = {"clearCache": "clear"} if body.clearCache else {}
+    if body.commitId:
+        payload["commitId"] = body.commitId
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(

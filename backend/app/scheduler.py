@@ -6,6 +6,8 @@ can push live updates to the frontend without page refreshes.
 import asyncio
 import hashlib
 import ipaddress
+import json
+import re
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
@@ -98,6 +100,65 @@ def _get_project_map(user_id: str, service_type: str) -> dict[str, str]:
     return mapping
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
+
+
+async def _fetch_vercel_build_errors(deployment_id: str, headers: dict, client: httpx.AsyncClient) -> list[str]:
+    """Fetch Vercel build logs for a failed deployment and return error lines."""
+    resp = await client.get(
+        f"{VERCEL_API}/v2/deployments/{deployment_id}/events",
+        headers=headers,
+        params={"direction": "backward", "limit": 100},
+    )
+    if resp.status_code != 200:
+        return []
+    events = resp.json() if isinstance(resp.json(), list) else []
+    lines = []
+    for event in events:
+        text = _ANSI_RE.sub("", event.get("text", "")).strip()
+        if text and _is_error_line(text):
+            lines.append(text[:200])
+    return lines[:20]
+
+
+async def _fetch_render_build_errors(svc_id: str, deploy_id: str, headers: dict, client: httpx.AsyncClient) -> list[str]:
+    """Fetch Render build logs for a failed deploy and return error lines."""
+    deploy_resp = await client.get(
+        f"{RENDER_API}/services/{svc_id}/deploys/{deploy_id}",
+        headers=headers,
+    )
+    if deploy_resp.status_code != 200:
+        return []
+    d = deploy_resp.json().get("deploy", deploy_resp.json())
+    created_at = d.get("createdAt", "")
+    finished_at = d.get("finishedAt", "")
+    if not created_at:
+        return []
+
+    owners_resp = await client.get(f"{RENDER_API}/owners", headers=headers, params={"limit": 1})
+    owner_id = None
+    if owners_resp.status_code == 200 and owners_resp.json():
+        owner_id = owners_resp.json()[0].get("owner", {}).get("id")
+
+    params: dict = {"resource": svc_id, "limit": 100, "startTime": created_at}
+    if finished_at:
+        params["endTime"] = finished_at
+    if owner_id:
+        params["ownerId"] = owner_id
+
+    logs_resp = await client.get(f"{RENDER_API}/logs", headers=headers, params=params)
+    if logs_resp.status_code != 200:
+        return []
+    raw = logs_resp.json()
+    entries = raw.get("logs", raw) if isinstance(raw, dict) else raw
+    lines = []
+    for entry in (entries if isinstance(entries, list) else []):
+        text = (entry.get("message") or entry.get("text") or "").strip()
+        if text and _is_error_line(text):
+            lines.append(text[:200])
+    return lines[:20]
+
+
 def _upsert_events(rows: list[dict]) -> None:
     if not rows:
         return
@@ -170,13 +231,23 @@ async def poll_vercel() -> None:
                     if team_slug and name:
                         external_url = f"https://vercel.com/{team_slug}/{name}/deployments/{uid}"
 
+                    subtitle = commit_msg or (f"Branch: {branch}" if branch else "")
+                    error_lines: list[str] = []
+                    if state == "ERROR" and uid:
+                        try:
+                            error_lines = await _fetch_vercel_build_errors(uid, headers, client)
+                            if error_lines:
+                                subtitle = error_lines[0]
+                        except Exception:
+                            pass
+
                     rows.append({
                         "user_id": user_id,
                         "project_id": project_map.get(project_id_vercel),
                         "service_type": "vercel",
                         "event_type": "deployment",
                         "title": name or "Deployment",
-                        "subtitle": commit_msg or (f"Branch: {branch}" if branch else ""),
+                        "subtitle": subtitle,
                         "status": state_map.get(state, "building"),
                         "external_url": external_url,
                         "external_id": uid,
@@ -184,6 +255,7 @@ async def poll_vercel() -> None:
                             "branch": branch,
                             "commit_message": commit_msg,
                             "state": state,
+                            **({"error_lines": error_lines} if error_lines else {}),
                         },
                         "occurred_at": _ms_to_iso(d.get("createdAt", 0)) if d.get("createdAt") else _now_iso(),
                     })
@@ -238,17 +310,30 @@ async def poll_render() -> None:
                             else "building"
                         )
                         msg = (commit.get("message") or "").split("\n")[0][:80]
+                        subtitle = msg
+                        build_error_lines: list[str] = []
+                        if raw_status == "build_failed":
+                            try:
+                                build_error_lines = await _fetch_render_build_errors(svc_id, d.get("id", ""), headers, client)
+                                if build_error_lines:
+                                    subtitle = build_error_lines[0]
+                            except Exception:
+                                pass
                         result.append({
                             "user_id": user_id,
                             "project_id": project_map.get(svc_id),
                             "service_type": "render",
                             "event_type": "deploy",
                             "title": svc_name,
-                            "subtitle": msg,
+                            "subtitle": subtitle,
                             "status": status,
                             "external_url": "https://dashboard.render.com",
                             "external_id": d.get("id", ""),
-                            "metadata": {"raw_status": raw_status, "commit_message": msg},
+                            "metadata": {
+                                "raw_status": raw_status,
+                                "commit_message": msg,
+                                **({"error_lines": build_error_lines} if build_error_lines else {}),
+                            },
                             "occurred_at": d.get("createdAt") or _now_iso(),
                         })
                     return result
@@ -371,6 +456,110 @@ async def poll_github() -> None:
                 logger.error("GitHub poll failed user=%s: %s", user["user_id"], exc)
 
 
+# ── Vercel log scanning ────────────────────────────────────────────────────
+
+async def scan_vercel_logs() -> None:
+    """Scan runtime logs of recent Vercel READY deployments for errors."""
+    users = _get_connected_users("vercel")
+    if not users:
+        return
+
+    now = datetime.now(timezone.utc)
+    cutoff_ms = (now - timedelta(minutes=3)).timestamp() * 1000
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0)) as client:
+        for user in users:
+            try:
+                token = decrypt_token(user["api_token"])
+                user_id = user["user_id"]
+                project_map = _get_project_map(user_id, "vercel")
+                headers = {"Authorization": f"Bearer {token}"}
+
+                # Collect recent READY deployments across all scopes
+                teams_resp = await client.get(f"{VERCEL_API}/v2/teams", headers=headers)
+                team_ids: list[str | None] = []
+                if teams_resp.status_code == 200:
+                    team_ids = [t["id"] for t in teams_resp.json().get("teams", [])]
+                team_ids.append(None)
+
+                seen_deps: set[str] = set()
+                recent_deps: list[dict] = []
+                for team_id in team_ids:
+                    params: dict = {"limit": 10, "state": "READY"}
+                    if team_id:
+                        params["teamId"] = team_id
+                    resp = await client.get(f"{VERCEL_API}/v6/deployments", headers=headers, params=params)
+                    if resp.status_code != 200:
+                        continue
+                    for d in resp.json().get("deployments", []):
+                        uid = d.get("uid", "")
+                        if uid and uid not in seen_deps:
+                            seen_deps.add(uid)
+                            recent_deps.append(d)
+
+                rows = []
+                for dep in recent_deps:
+                    dep_id = dep.get("uid", "")
+                    project_id_vercel = dep.get("projectId", "")
+                    dep_name = dep.get("name", "deployment")
+                    if not dep_id:
+                        continue
+
+                    try:
+                        async with client.stream(
+                            "GET",
+                            f"{VERCEL_API}/v1/deployments/{dep_id}/runtime-logs",
+                            headers=headers,
+                            timeout=httpx.Timeout(connect=8.0, read=8.0, write=5.0, pool=5.0),
+                        ) as stream:
+                            if stream.status_code != 200:
+                                continue
+                            error_lines = []
+                            async for raw_line in stream.aiter_lines():
+                                raw_line = raw_line.strip()
+                                if not raw_line:
+                                    continue
+                                try:
+                                    entry = json.loads(raw_line)
+                                    ts = entry.get("timestampInMs", 0)
+                                    if ts and ts < cutoff_ms:
+                                        continue
+                                    text = (entry.get("message") or entry.get("text") or "").strip()
+                                    if _is_error_line(text):
+                                        error_lines.append(text)
+                                except Exception:
+                                    continue
+
+                            if not error_lines:
+                                continue
+
+                            first = error_lines[0][:200]
+                            error_id = hashlib.md5(f"vercel:{dep_id}:{first[:100]}".encode()).hexdigest()
+                            rows.append({
+                                "user_id": user_id,
+                                "project_id": project_map.get(project_id_vercel),
+                                "service_type": "vercel",
+                                "event_type": "runtime_error",
+                                "title": f"Runtime error in {dep_name}",
+                                "subtitle": first[:120],
+                                "status": "error",
+                                "external_url": f"https://vercel.com/{dep_name}",
+                                "external_id": error_id,
+                                "metadata": {"errors": error_lines[:10], "deployment_id": dep_id, "service_name": dep_name},
+                                "occurred_at": _now_iso(),
+                            })
+                    except (httpx.ReadTimeout, asyncio.TimeoutError):
+                        continue
+                    except Exception as exc:
+                        logger.error("Vercel log scan dep=%s failed: %s", dep_id, exc)
+                        continue
+
+                _upsert_events(rows)
+
+            except Exception as exc:
+                logger.error("Vercel log scan failed user=%s: %s", user["user_id"], exc)
+
+
 # ── Render metrics alerting ────────────────────────────────────────────────
 
 async def poll_render_metrics() -> None:
@@ -470,7 +659,14 @@ async def poll_render_metrics() -> None:
 # ── Render log scanning ────────────────────────────────────────────────────
 
 _ERROR_PATTERNS = ["error", "exception", "traceback", "fatal", "panic", "crash", "unhandled rejection", "segfault"]
-_NOISE_PATTERNS = ["health check", "healthcheck", "GET /health", "200 ok"]
+_NOISE_PATTERNS = [
+    "health check", "healthcheck", "GET /health", "200 ok",
+    "http request:", "httpx -",
+    "api.render.com", "api.vercel.com", "api.github.com", "api.supabase.com",
+    "log scan failed", "poll failed", "metrics poll failed",
+    "apscheduler", "uvicorn", "info:     ",
+    " vantage - ",  # Vantage's own Python logger format: "LEVEL vantage - message"
+]
 
 
 def _is_error_line(text: str) -> bool:
@@ -513,7 +709,6 @@ async def scan_render_logs() -> None:
                     svc_name = svc.get("name", "")
                     if not svc_id:
                         continue
-
                     params: dict = {"resource": svc_id, "limit": 100, "startTime": start_time, "endTime": end_time}
                     if owner_id:
                         params["ownerId"] = owner_id
@@ -752,6 +947,15 @@ def cleanup_uptime_checks() -> None:
         logger.error("Uptime cleanup failed: %s", exc)
 
 
+def cleanup_events() -> None:
+    """Delete events rows older than 30 days."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    try:
+        supabase.table("events").delete().lt("created_at", cutoff).execute()
+    except Exception as exc:
+        logger.error("Events cleanup failed: %s", exc)
+
+
 # ── Scheduler setup ────────────────────────────────────────────────────────
 
 def start_scheduler() -> None:
@@ -760,9 +964,11 @@ def start_scheduler() -> None:
     scheduler.add_job(poll_github, "interval", minutes=5, id="poll_github", max_instances=1)
     scheduler.add_job(poll_render_metrics, "interval", minutes=10, id="render_metrics", max_instances=1)
     scheduler.add_job(scan_render_logs, "interval", minutes=2, id="scan_render_logs", max_instances=1)
+    scheduler.add_job(scan_vercel_logs, "interval", minutes=2, id="scan_vercel_logs", max_instances=1)
     scheduler.add_job(check_render_service_health, "interval", minutes=10, id="render_health", max_instances=1)
     scheduler.add_job(check_endpoints, "interval", minutes=10, id="check_endpoints", max_instances=1)
     scheduler.add_job(cleanup_uptime_checks, "interval", hours=6, id="cleanup_uptime", max_instances=1)
+    scheduler.add_job(cleanup_events, "interval", hours=6, id="cleanup_events", max_instances=1)
     scheduler.start()
     logger.info("Scheduler started")
 

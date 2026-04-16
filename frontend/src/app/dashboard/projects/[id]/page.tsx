@@ -13,6 +13,7 @@ import type {
   DeployAnalysis, UptimeStatus, EnvVar, LogLine, Investigation, RuntimeError,
 } from "@/types/project";
 import { InsightPanel } from "@/components/project/InsightPanel";
+
 import { BuildTrendChart } from "@/components/project/BuildTrendChart";
 import { DORAMetrics } from "@/components/project/DORAMetrics";
 import { DeploymentRow } from "@/components/project/DeploymentRow";
@@ -23,37 +24,71 @@ import { GitHubCard, CommitRow, PRRow } from "@/components/project/GitHubCard";
 import { SupabaseCard, SB_COLOR } from "@/components/project/SupabaseCard";
 
 // --- Log drawer ---
-function LogDrawer({ logsUrl, title, subtitle, onClose }: {
-  logsUrl: string | null; title: string; subtitle: string; onClose: () => void;
+function LogDrawer({ logsUrl, title, subtitle, isLive, onClose }: {
+  logsUrl: string | null; title: string; subtitle: string; isLive?: boolean; onClose: () => void;
 }) {
   const [lines, setLines] = useState<LogLine[]>([]);
   const [loading, setLoading] = useState(false);
+  const [live, setLive] = useState(false);
   const errorRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const atBottomRef = useRef(true);
+
+  const fetchLogs = (url: string, initial: boolean) => {
+    if (initial) setLoading(true);
+    apiFetch(url)
+      .then((r) => r.json())
+      .then((d) => {
+        setLines(d.lines ?? []);
+        if (initial) setLoading(false);
+      })
+      .catch(() => { if (initial) setLoading(false); });
+  };
 
   useEffect(() => {
     if (!logsUrl) return;
     setLines([]);
-    setLoading(true);
-    apiFetch(logsUrl)
-      .then((r) => r.json())
-      .then((d) => setLines(d.lines ?? []))
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, [logsUrl]);
+    setLive(!!isLive);
+    fetchLogs(logsUrl, true);
+  }, [logsUrl, isLive]);
 
-  // Auto-scroll to first error after load
+  // Poll every 5s when live — grow the window each tick so logs accumulate
+  useEffect(() => {
+    if (!live || !logsUrl) return;
+    let window = 60;
+    const id = setInterval(() => {
+      window += 5;
+      const url = logsUrl.includes("window=")
+        ? logsUrl.replace(/window=\d+/, `window=${window}`)
+        : logsUrl;
+      fetchLogs(url, false);
+    }, 5000);
+    return () => clearInterval(id);
+  }, [live, logsUrl]);
+
+  // Track scroll position to know if user is at bottom
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const onScroll = () => { atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40; };
+    el.addEventListener("scroll", onScroll);
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  // Auto-scroll: on initial load go to first error; when live and at bottom, follow tail
   useEffect(() => {
     if (!loading && lines.length > 0) {
       setTimeout(() => {
-        if (errorRef.current) {
+        if (!live && errorRef.current) {
           errorRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
-        } else {
+        } else if (live && atBottomRef.current) {
+          containerRef.current?.scrollTo({ top: containerRef.current.scrollHeight, behavior: "smooth" });
+        } else if (!live) {
           containerRef.current?.scrollTo({ top: containerRef.current.scrollHeight, behavior: "smooth" });
         }
       }, 100);
     }
-  }, [loading, lines]);
+  }, [loading, lines, live]);
 
   // Close on Escape
   useEffect(() => {
@@ -90,7 +125,12 @@ function LogDrawer({ logsUrl, title, subtitle, onClose }: {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <span className="text-[11px] text-white/30"></span>
+            {live && (
+              <span className="flex items-center gap-1.5 text-[11px] text-red-400">
+                <span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" />
+                Live
+              </span>
+            )}
             <button
               onClick={onClose}
               className="w-7 h-7 rounded-lg bg-white/5 hover:bg-white/10 flex items-center justify-center text-white/50 hover:text-white/90 transition-colors"
@@ -162,6 +202,181 @@ function LogDrawer({ logsUrl, title, subtitle, onClose }: {
   );
 }
 
+// --- Error modal ---
+type ErrorModalData = { id: string; label: string; fullTime: string; commit?: string; type: "runtime" | "build"; details?: string[]; logsUrl?: string; };
+type AIErrorResult = { error: string; root_cause: string; fix: string };
+const _errorAICache = new Map<string, AIErrorResult>();
+
+function ErrorModal({ data, onClose }: { data: ErrorModalData; onClose: () => void }) {
+  const [lines, setLines] = useState<string[]>(data.details ?? []);
+  const [loading, setLoading] = useState(false);
+  const [ai, setAi] = useState<AIErrorResult | null>(_errorAICache.get(data.id) ?? null);
+  const [aiLoading, setAiLoading] = useState(false);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onClose]);
+
+  // Load logs
+  useEffect(() => {
+    if (data.details) { setLines(data.details); return; }
+    if (!data.logsUrl) return;
+    setLoading(true);
+    apiFetch(data.logsUrl)
+      .then(r => r.json())
+      .then(d => {
+        const raw: unknown[] = d.lines ?? [];
+        const parsed = raw.map(l =>
+          typeof l === "string" ? l : (l as { text?: string; message?: string }).text ?? (l as { message?: string }).message ?? ""
+        ).filter(Boolean);
+        setLines(parsed.length ? parsed : []);
+      })
+      .catch(() => setLines([]))
+      .finally(() => setLoading(false));
+  }, [data.logsUrl, data.details]);
+
+  // Fire AI analysis once logs are ready, skip if cached
+  useEffect(() => {
+    if (_errorAICache.has(data.id)) return;
+    if (loading) return;
+    if (lines.length === 0) return;
+    setAiLoading(true);
+    apiFetch("/api/insights/analyze-error", {
+      method: "POST",
+      body: JSON.stringify({ lines: lines.slice(0, 80), error_type: data.type }),
+    })
+      .then(r => r.json())
+      .then((result: AIErrorResult) => {
+        _errorAICache.set(data.id, result);
+        setAi(result);
+      })
+      .catch(() => {})
+      .finally(() => setAiLoading(false));
+  }, [loading, lines, data.id, data.type]);
+
+  const errorLines = lines.filter(l => /error|fatal|exception|traceback/i.test(l));
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+      <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        {/* Header */}
+        <div className="flex items-start justify-between px-6 py-4 border-b border-gray-100">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full uppercase tracking-wider shrink-0 ${data.type === "build" ? "text-red-600 bg-red-50" : "text-red-600 bg-red-50"}`}>{data.type} error</span>
+            <h2 className="text-[14px] font-semibold text-gray-900 truncate">{data.label}</h2>
+          </div>
+          <button onClick={onClose} className="ml-4 p-1.5 rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors shrink-0">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12" /></svg>
+          </button>
+        </div>
+
+        {/* Metadata */}
+        <div className="flex items-center gap-4 px-6 py-3 bg-gray-50/60 border-b border-gray-100 flex-wrap">
+          <div>
+            <div className="text-[9px] uppercase tracking-wider text-gray-400 mb-0.5">When</div>
+            <div className="text-[12px] text-gray-700">{data.fullTime}</div>
+          </div>
+          {data.commit && (
+            <div className="min-w-0">
+              <div className="text-[9px] uppercase tracking-wider text-gray-400 mb-0.5">Commit</div>
+              <div className="text-[12px] text-gray-700 truncate max-w-xs">{data.commit}</div>
+            </div>
+          )}
+          {errorLines.length > 0 && (
+            <div className="ml-auto">
+              <span className="text-[10px] font-medium text-red-500">{errorLines.length} error line{errorLines.length !== 1 ? "s" : ""}</span>
+            </div>
+          )}
+        </div>
+
+        <div className="flex-1 overflow-y-auto">
+          {/* AI insight */}
+          <div className="px-6 py-4 border-b border-gray-100">
+            {aiLoading || loading ? (
+              <div className="flex items-center gap-2 text-[12px] text-gray-400">
+                <svg className="w-3.5 h-3.5 animate-spin text-brand-purple" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
+                Analyzing with AI…
+              </div>
+            ) : ai ? (
+              <div className="space-y-3">
+                <div className="flex items-center gap-1.5 mb-3">
+                  <svg className="w-3.5 h-3.5 text-brand-purple" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
+                  <span className="text-[10px] font-semibold text-brand-purple uppercase tracking-wider">AI Analysis</span>
+                </div>
+                <div>
+                  <div className="text-[9px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Error</div>
+                  <p className="text-[12px] text-gray-800 font-medium">{ai.error}</p>
+                </div>
+                <div>
+                  <div className="text-[9px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Root Cause</div>
+                  <p className="text-[12px] text-gray-700">{ai.root_cause}</p>
+                </div>
+                <div>
+                  <div className="text-[9px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Fix</div>
+                  <p className="text-[12px] text-emerald-700 font-medium">{ai.fix}</p>
+                </div>
+              </div>
+            ) : (
+              <p className="text-[12px] text-gray-400">No AI analysis available</p>
+            )}
+          </div>
+
+          {/* Log output */}
+          <div className="bg-gray-950 p-4 min-h-30">
+            {loading ? (
+              <p className="text-[12px] text-gray-500 text-center py-6">Loading logs…</p>
+            ) : lines.length === 0 ? (
+              <p className="text-[12px] text-gray-600 text-center py-6">No log output available</p>
+            ) : (
+              <div className="font-mono text-[11px] space-y-0.5">
+                {lines.map((line, i) => {
+                  const isErr = /error|fatal|exception|traceback/i.test(line);
+                  return (
+                    <div key={i} className={`whitespace-pre-wrap break-all leading-5 ${isErr ? "text-red-400 font-medium" : "text-gray-400"}`}>
+                      {line}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="px-6 py-2.5 border-t border-gray-100 bg-gray-50/60">
+          <span className="text-[10px] text-gray-400">{lines.length} lines · ESC to close</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- Error row ---
+function ErrorRow({ id, label, time, fullTime, commit, type, details, logsUrl, onOpen }: {
+  id: string; label: string; time: string; fullTime?: string; commit?: string;
+  type: "runtime" | "build"; details?: string[]; logsUrl?: string;
+  onOpen: (data: ErrorModalData) => void;
+}) {
+  return (
+    <div className="border-b border-gray-100 last:border-0">
+      <button
+        onClick={() => onOpen({ id, label, fullTime: fullTime ?? time, commit, type, details, logsUrl })}
+        className="w-full px-5 py-3 text-left hover:bg-gray-50/60 transition-colors group"
+      >
+        <div className="flex items-center gap-2 mb-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0" />
+          <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full uppercase tracking-wider ${type === "build" ? "text-red-600 bg-red-50" : "text-red-600 bg-red-50"}`}>{type}</span>
+          <span className="text-[10px] text-gray-400 ml-auto">{time}</span>
+          <svg className="w-3 h-3 text-gray-300 group-hover:text-brand-purple transition-colors" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
+        </div>
+        <p className="text-[12px] font-medium text-gray-800 truncate">{label}</p>
+        {commit && <p className="text-[11px] text-gray-400 truncate mt-0.5">{commit}</p>}
+      </button>
+    </div>
+  );
+}
+
 // --- Main page ---
 export default function ProjectPage() {
   const { id } = useParams<{ id: string }>();
@@ -185,8 +400,9 @@ export default function ProjectPage() {
   const [githubTab, setGithubTab] = useState<"commits" | "prs">("commits");
   const [linking, setLinking] = useState(false);
   const [deploying, setDeploying] = useState(false);
-  const [insightRefreshKey, setInsightRefreshKey] = useState(0);
-  const [logDrawer, setLogDrawer] = useState<{ logsUrl: string; title: string; subtitle: string } | null>(null);
+
+  const [logDrawer, setLogDrawer] = useState<{ logsUrl: string; title: string; subtitle: string; isLive?: boolean } | null>(null);
+  const [errorModal, setErrorModal] = useState<ErrorModalData | null>(null);
   const [vercelFilter, setVercelFilter] = useState<"all" | "production" | "failures" | "preview">("all");
   const [vercelDetailTab, setVercelDetailTab] = useState<"deployments" | "env">("deployments");
   const [uptimeData, setUptimeData] = useState<Record<string, UptimeStatus>>({});
@@ -196,6 +412,10 @@ export default function ProjectPage() {
   const [investigation, setInvestigation] = useState<Investigation | null>(null);
   const [investigating, setInvestigating] = useState(false);
   const [runtimeErrors, setRuntimeErrors] = useState<RuntimeError[]>([]);
+  const [showAllDeploys, setShowAllDeploys] = useState(false);
+  const [showAllVercel, setShowAllVercel] = useState(false);
+  const [showAllCommits, setShowAllCommits] = useState(false);
+  const [showAllPRs, setShowAllPRs] = useState(false);
   const prevVercelStates = useRef<Record<string, string>>({});
   const prevRenderStates = useRef<Record<string, string>>({});
   const autoInvestigated = useRef(false);
@@ -292,6 +512,10 @@ export default function ProjectPage() {
                 .then((r) => r.json()).then((d) => setPulls(d.pulls ?? [])).catch(() => {});
             }
           }
+          if ((row.event_type as string) === "runtime_error") {
+            apiFetch(`/api/events?event_type=runtime_error&project_id=${p.id}&limit=20`)
+              .then((r) => r.json()).then((d) => setRuntimeErrors(d.events ?? [])).catch(() => {});
+          }
         }
       )
       .subscribe();
@@ -334,7 +558,6 @@ export default function ProjectPage() {
             );
             prevVercelStates.current = Object.fromEntries(newDeploys.map((dep: { id: string; state: string }) => [dep.id, dep.state]));
             setDeployments(newDeploys);
-            if (settled) setInsightRefreshKey((k) => k + 1);
           })
           .catch(() => {});
       }
@@ -344,16 +567,10 @@ export default function ProjectPage() {
           .then((r) => r.json())
           .then((d) => {
             const newDeploys = d.deploys ?? [];
-            const settledStatuses = ["live", "build_failed", "canceled", "deactivated"];
             const justFailed = newDeploys.some(
               (dep: { id: string; status: string }) =>
                 ["build_in_progress", "update_in_progress", "pre_deploy_in_progress"].includes(prevRenderStates.current[dep.id]) &&
                 dep.status === "build_failed"
-            );
-            const settled = newDeploys.some(
-              (dep: { id: string; status: string }) =>
-                ["build_in_progress", "update_in_progress", "pre_deploy_in_progress"].includes(prevRenderStates.current[dep.id]) &&
-                settledStatuses.includes(dep.status)
             );
             prevRenderStates.current = Object.fromEntries(newDeploys.map((dep: { id: string; status: string }) => [dep.id, dep.status]));
             setRenderDeploys(newDeploys);
@@ -369,7 +586,6 @@ export default function ProjectPage() {
                 .catch(() => {})
                 .finally(() => setInvestigating(false));
             }
-            if (settled) setInsightRefreshKey((k) => k + 1);
           })
           .catch(() => {});
       }
@@ -396,6 +612,12 @@ export default function ProjectPage() {
     if (!failingService && supabaseSvc && supabaseHealth.some((s) => s.status === "ACTIVE_UNHEALTHY")) {
       failingService = "supabase";
     }
+    if (!failingService && renderSvc && runtimeErrors.some(e => e.service === "render")) {
+      failingService = "render";
+    }
+    if (!failingService && vercelSvc && runtimeErrors.some(e => e.service === "vercel")) {
+      failingService = "vercel";
+    }
     if (!failingService) return;
     autoInvestigated.current = true;
     setInvestigating(true);
@@ -408,7 +630,7 @@ export default function ProjectPage() {
       .then((data) => setInvestigation(data))
       .catch(() => {})
       .finally(() => setInvestigating(false));
-  }, [loading, deployments, renderDeploys, supabaseHealth, project]);
+  }, [loading, deployments, renderDeploys, supabaseHealth, runtimeErrors.length, project]);
 
   // Uptime checks — fire once when we have deployment URLs to ping
   useEffect(() => {
@@ -438,7 +660,7 @@ export default function ProjectPage() {
         .then((r) => r.json())
         .then((d) => {
           const svc = (d.services ?? []).find((s: { id: string; url: string | null }) => s.id === renderSvc.resource_id);
-          if (svc?.url) runCheck("render", renderSvc.resource_id, svc.url);
+          if (svc?.url) runCheck("render", renderSvc.resource_id, svc.url.replace(/\/$/, "") + "/health");
         })
         .catch(() => {});
     }
@@ -556,7 +778,7 @@ export default function ProjectPage() {
   return (
     <>
       {/* Header */}
-      <div className="mb-7 flex items-start justify-between">
+      <div className="mb-4 flex items-start justify-between">
         <div>
           <h1 className="text-[28px] font-semibold text-white/95 tracking-tight mb-1">{project.name}</h1>
           {project.description && <p className="text-sm text-white/60">{project.description}</p>}
@@ -582,7 +804,7 @@ export default function ProjectPage() {
         const alerts: { service: string; message: string; svcId: string }[] = [];
         const renderSvc = project.project_services.find(s => s.service_type === "render");
         if (renderSvc && renderDeploys.length >= 3 && renderDeploys[0]?.status === "build_failed") {
-          const live = renderDeploys.filter(d => d.status === "live").length;
+          const live = renderDeploys.filter(d => d.status === "live" || d.status === "deactivated").length;
           const rate = Math.round(live / renderDeploys.length * 100);
           if (rate < 50) alerts.push({ service: "Render", message: `Render has a ${rate}% success rate in the last ${renderDeploys.length} deploys. Investigate immediately.`, svcId: renderSvc.id });
         }
@@ -600,7 +822,7 @@ export default function ProjectPage() {
         if (alerts.length === 0) return null;
         const alert = alerts[0];
         return (
-          <div className="mb-5 flex items-start gap-3 bg-amber-50 border border-amber-200 rounded-card px-5 py-4 shadow-card animate-slide-up">
+          <div className="mb-4 flex items-start gap-3 bg-amber-50 border border-amber-200 rounded-card px-5 py-4 shadow-card animate-slide-up">
             <span className="text-xl shrink-0">⚠️</span>
             <div>
               <p className="text-[13px] font-semibold text-amber-900">Deployment Issue Detected</p>
@@ -610,14 +832,23 @@ export default function ProjectPage() {
         );
       })()}
 
-      {/* AI Insight + Investigation (unified) */}
+      {/* AI health insight + errors */}
       {project.project_services.length > 0 && (
         <InsightPanel
           projectId={project.id}
-          refreshKey={insightRefreshKey}
+          runtimeErrors={runtimeErrors}
           investigation={investigation}
           investigating={investigating}
-          onDismiss={() => setInvestigation(null)}
+          onInvestigate={(serviceType) => {
+            const svc = project.project_services.find((s) => s.service_type === serviceType);
+            if (!svc) return;
+            setInvestigating(true);
+            apiFetch(`/api/insights/investigate?project_id=${project.id}&service_type=${serviceType}&service_id=${svc.resource_id}`)
+              .then((r) => r.json())
+              .then((data) => setInvestigation(data))
+              .catch(() => {})
+              .finally(() => setInvestigating(false));
+          }}
         />
       )}
 
@@ -635,18 +866,18 @@ export default function ProjectPage() {
         </div>
       ) : (
         <div
-          className="grid gap-3.5 mb-6"
+          className="grid gap-3.5 mb-4"
           style={{ gridTemplateColumns: `repeat(${Math.min(project.project_services.length, 4)}, minmax(0, 1fr))` }}
         >
           {project.project_services.map((svc) => {
             if (svc.service_type === "vercel") {
-              return <VercelCard key={svc.id} service={svc} deployments={deployments} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} uptime={uptimeData[`vercel:${svc.resource_id}`]} />;
+              return <VercelCard key={svc.id} service={svc} deployments={deployments} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} uptime={uptimeData[`vercel:${svc.resource_id}`]} hasRuntimeErrors={runtimeErrors.some(e => e.service === "vercel")} onInvestigate={() => setSelectedService(svc.id)} />;
             }
             if (svc.service_type === "github") {
               return <GitHubCard key={svc.id} service={svc} commits={commits} pulls={pulls} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
             }
             if (svc.service_type === "render") {
-              return <RenderCard key={svc.id} service={svc} deploys={renderDeploys} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
+              return <RenderCard key={svc.id} service={svc} deploys={renderDeploys} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} hasRuntimeErrors={runtimeErrors.some(e => e.service === "render")} uptime={uptimeData[`render:${svc.resource_id}`]} onInvestigate={() => setSelectedService(svc.id)} />;
             }
             if (svc.service_type === "supabase") {
               return <SupabaseCard key={svc.id} service={svc} health={supabaseHealth} overview={supabaseOverview} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
@@ -735,59 +966,6 @@ export default function ProjectPage() {
             </div>
           </div>
 
-          {/* Stats strip for Vercel */}
-          {activeService.service_type === "vercel" && deployments.length > 0 && (() => {
-            const week = deployments.filter(d => Date.now() - d.created_at < 7 * 86400000).length;
-            const ready = deployments.filter(d => d.state === "READY").length;
-            const rate = Math.round(ready / deployments.length * 100);
-            const withDur = deployments.filter(d => d.build_duration != null);
-            const avg = withDur.length ? Math.round(withDur.reduce((s, d) => s + d.build_duration!, 0) / withDur.length) : null;
-            let streak = 0;
-            for (const d of deployments) { if (d.state === "READY") streak++; else break; }
-            const chips = [
-              { label: "This week", value: String(week) },
-              { label: "Success rate", value: `${rate}%`, color: rate >= 80 ? "text-emerald-600" : rate >= 50 ? "text-amber-600" : "text-red-500" },
-              { label: "Avg build", value: avg != null ? `${avg}s` : "—" },
-              { label: "Streak", value: streak > 0 ? `${streak} ✓` : "—", color: streak >= 3 ? "text-emerald-600" : undefined },
-            ];
-            return (
-              <div className="flex items-center gap-2 mb-2.5">
-                {chips.map((c) => (
-                  <div key={c.label} className="flex items-center gap-1.5 bg-white/60 border border-white/60 rounded-lg px-3 py-1.5 shadow-sm">
-                    <span className={`text-[13px] font-semibold ${c.color ?? "text-gray-800"}`}>{c.value}</span>
-                    <span className="text-[10px] text-gray-400">{c.label}</span>
-                  </div>
-                ))}
-              </div>
-            );
-          })()}
-
-          {/* Stats strip for Render */}
-          {activeService.service_type === "render" && renderDeploys.length > 0 && (() => {
-            const week = renderDeploys.filter(d => Date.now() - new Date(d.created_at).getTime() < 7 * 86400000).length;
-            const live = renderDeploys.filter(d => d.status === "live").length;
-            const rate = Math.round(live / renderDeploys.length * 100);
-            const withDur = renderDeploys.filter(d => d.finished_at);
-            const avg = withDur.length ? Math.round(withDur.reduce((s, d) => s + (new Date(d.finished_at!).getTime() - new Date(d.created_at).getTime()) / 1000, 0) / withDur.length) : null;
-            let streak = 0;
-            for (const d of renderDeploys) { if (d.status === "live") streak++; else break; }
-            const chips = [
-              { label: "This week", value: String(week) },
-              { label: "Success rate", value: `${rate}%`, color: rate >= 80 ? "text-emerald-600" : rate >= 50 ? "text-amber-600" : "text-red-500" },
-              { label: "Avg build", value: avg != null ? `${avg}s` : "—" },
-              { label: "Streak", value: streak > 0 ? `${streak} ✓` : "—", color: streak >= 3 ? "text-emerald-600" : undefined },
-            ];
-            return (
-              <div className="flex items-center gap-2 mb-2.5">
-                {chips.map((c) => (
-                  <div key={c.label} className="flex items-center gap-1.5 bg-white/60 border border-white/60 rounded-lg px-3 py-1.5 shadow-sm">
-                    <span className={`text-[13px] font-semibold ${c.color ?? "text-gray-800"}`}>{c.value}</span>
-                    <span className="text-[10px] text-gray-400">{c.label}</span>
-                  </div>
-                ))}
-              </div>
-            );
-          })()}
 
           <>
             {activeService.service_type === "vercel" && (() => {
@@ -840,7 +1018,13 @@ export default function ProjectPage() {
                 return true;
               });
               const maxBuildDuration = Math.max(...filtered.map(d => d.build_duration ?? 0), 1);
-              const groups = groupByDate(filtered);
+              const vercelWeek = deployments.filter(d => Date.now() - d.created_at < 7 * 86400000).length;
+              const vercelReady = deployments.filter(d => d.state === "READY").length;
+              const vercelRate = deployments.length ? Math.round(vercelReady / deployments.length * 100) : 0;
+              const vercelWithDur = deployments.filter(d => d.build_duration != null);
+              const vercelAvg = vercelWithDur.length ? Math.round(vercelWithDur.reduce((s, d) => s + d.build_duration!, 0) / vercelWithDur.length) : null;
+              let vercelStreak = 0;
+              for (const d of deployments) { if (d.state === "READY") vercelStreak++; else break; }
               const FILTERS = [
                 { key: "all",        label: "All" },
                 { key: "production", label: "Production" },
@@ -859,7 +1043,24 @@ export default function ProjectPage() {
                       commit: d.commit_message ?? "",
                       ts: d.created_at,
                     }))} />
-                    <DORAMetrics deployments={deployments} />
+                    <div className="flex items-center justify-between px-5 py-2 bg-gray-50/60 border-t border-gray-100 gap-6">
+                      <div className="flex items-center gap-3 shrink-0">
+                        <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Stats</span>
+                        {([
+                          { label: "This week", value: String(vercelWeek) },
+                          { label: "Success", value: `${vercelRate}%`, color: vercelRate >= 80 ? "text-emerald-600" : vercelRate >= 50 ? "text-amber-600" : "text-red-500" },
+                          { label: "Avg build", value: vercelAvg != null ? `${vercelAvg}s` : "—" },
+                          ...(vercelStreak >= 2 ? [{ label: "Streak", value: `${vercelStreak} ✓`, color: "text-emerald-600" }] : []),
+                        ] as { label: string; value: string; color?: string }[]).map((s, i) => (
+                          <span key={s.label} className="flex items-center gap-1.5">
+                            {i > 0 && <span className="text-gray-200">·</span>}
+                            <span className={`text-[11px] font-semibold ${s.color ?? "text-gray-900"}`}>{s.value}</span>
+                            <span className="text-[10px] text-gray-400">{s.label}</span>
+                          </span>
+                        ))}
+                      </div>
+                      <DORAMetrics deployments={deployments} inline />
+                    </div>
                     {vercelUptime && vercelUptime.checks.length > 0 && (
                       <div className="px-5 py-3">
                         <div className="flex items-center justify-between mb-1.5">
@@ -898,6 +1099,8 @@ export default function ProjectPage() {
                     </div>
                   ))}
 
+                  {/* Deploy history + Errors 2-col grid */}
+                  <div className="grid grid-cols-2 gap-3">
                   {/* Deployment history card */}
                   <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100">
                     <div className="flex items-center gap-1 px-5 py-2.5">
@@ -916,36 +1119,122 @@ export default function ProjectPage() {
                     </div>
                     {filtered.length === 0
                       ? <p className="text-sm text-gray-400 text-center py-12">No deployments match this filter</p>
-                      : groups.map((group) => (
-                          <div key={group.label}>
-                            <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
-                              <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{group.label}</span>
-                            </div>
-                            {group.items.map((d, i) => (
-                              <DeploymentRow
-                                key={d.id}
-                                deployment={d}
-                                index={i}
-                                maxBuildDuration={maxBuildDuration}
-                                githubRepo={githubSvc?.resource_id}
-                                initialAnalysis={proactiveAlerts[d.id]}
-                                logsHref={d.team_slug ? `https://vercel.com/${d.team_slug}/${d.name || activeService?.resource_name}/deployments/${d.id}` : undefined}
-                                onRedeploy={async (depId) => {
-                                  setDeploying(true);
-                                  try {
-                                    const res = await apiFetch("/api/vercel/redeploy", { method: "POST", body: JSON.stringify({ deploymentId: depId }) });
-                                    if (res.ok) {
-                                      const nd = await res.json();
-                                      setDeployments((prev) => [{ ...d, id: nd.id, state: "BUILDING", created_at: Date.now() }, ...prev]);
-                                    }
-                                  } finally { setDeploying(false); }
-                                }}
-                              />
-                            ))}
-                          </div>
-                        ))
+                      : (() => {
+                          const visibleFiltered = showAllVercel ? filtered : filtered.slice(0, 5);
+                          const visibleGroups = groupByDate(visibleFiltered);
+                          return (
+                            <>
+                              {visibleGroups.map((group) => (
+                                <div key={group.label}>
+                                  <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
+                                    <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{group.label}</span>
+                                  </div>
+                                  {group.items.map((d, i) => (
+                                    <DeploymentRow
+                                      key={d.id}
+                                      deployment={d}
+                                      index={i}
+                                      maxBuildDuration={maxBuildDuration}
+                                      githubRepo={githubSvc?.resource_id}
+                                      initialAnalysis={proactiveAlerts[d.id]}
+                                      onViewLogs={(depId, name) => setLogDrawer({
+                                        logsUrl: `/api/vercel/logs/${depId}/runtime?window=300`,
+                                        title: "Runtime Logs",
+                                        subtitle: name,
+                                        isLive: true,
+                                      })}
+                                      onRedeploy={async (depId) => {
+                                        setDeploying(true);
+                                        try {
+                                          const res = await apiFetch("/api/vercel/redeploy", { method: "POST", body: JSON.stringify({ deploymentId: depId }) });
+                                          if (res.ok) {
+                                            const nd = await res.json();
+                                            setDeployments((prev) => [{ ...d, id: nd.id, state: "BUILDING", created_at: Date.now() }, ...prev]);
+                                          }
+                                        } finally { setDeploying(false); }
+                                      }}
+                                    />
+                                  ))}
+                                </div>
+                              ))}
+                              {filtered.length > 5 && (
+                                <button
+                                  onClick={() => setShowAllVercel((v) => !v)}
+                                  className="w-full py-2.5 text-[11px] text-gray-400 hover:text-gray-600 transition-colors border-t border-gray-100"
+                                >
+                                  {showAllVercel ? "Show less" : `View all ${filtered.length} deployments`}
+                                </button>
+                              )}
+                            </>
+                          );
+                        })()
                     }
                   </div>
+                  {/* Vercel Errors card */}
+                  {(() => {
+                    const vercelRuntimeErrors = runtimeErrors.filter(e => e.service === "vercel");
+                    const vercelBuildErrors = deployments.filter(d => d.state === "ERROR").slice(0, 5);
+                    const hasErrors = vercelRuntimeErrors.length > 0 || vercelBuildErrors.length > 0;
+                    return (
+                      <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
+                        <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
+                          <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
+                            Errors {hasErrors && <span className="text-red-500 ml-1">{vercelRuntimeErrors.length + vercelBuildErrors.length}</span>}
+                          </p>
+                        </div>
+                        {!hasErrors ? (
+                          <div className="px-5 py-8 text-center">
+                            <p className="text-[12px] text-gray-400">No errors detected</p>
+                          </div>
+                        ) : (
+                          <>
+                            {vercelRuntimeErrors.length > 0 && (
+                              <>
+                                <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
+                                  <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Runtime</span>
+                                </div>
+                                <div className="divide-y divide-gray-100">
+                                  {vercelRuntimeErrors.slice(0, 5).map((e) => (
+                                    <ErrorRow
+                                      key={e.id} id={e.id}
+                                      type="runtime"
+                                      label={e.subtitle || e.title}
+                                      time={new Date(e.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                                      fullTime={new Date(e.timestamp).toLocaleString()}
+                                      details={e.metadata?.errors}
+                                      onOpen={setErrorModal}
+                                    />
+                                  ))}
+                                </div>
+                              </>
+                            )}
+                            {vercelBuildErrors.length > 0 && (
+                              <>
+                                <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100 border-t border-t-gray-100">
+                                  <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Build</span>
+                                </div>
+                                <div className="divide-y divide-gray-100">
+                                  {vercelBuildErrors.map((d) => (
+                                    <ErrorRow
+                                      key={d.id} id={d.id}
+                                      type="build"
+                                      label="Build failed"
+                                      commit={d.commit_message ?? undefined}
+                                      time={new Date(d.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                                      fullTime={new Date(d.created_at).toLocaleString()}
+                                      logsUrl={`/api/vercel/deployments/${d.id}/logs`}
+                                      onOpen={setErrorModal}
+                                    />
+                                  ))}
+                                </div>
+                              </>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    );
+                  })()}
+                  </div>{/* end deploy+errors grid */}
                 </>
               );
             })()}
@@ -954,93 +1243,218 @@ export default function ProjectPage() {
                 {githubTab === "commits" && (
                   commits.length === 0
                     ? <p className="text-sm text-gray-400 text-center py-12">No commits found</p>
-                    : commits.map((c, i) => <CommitRow key={c.sha} commit={c} index={i} />)
+                    : <>
+                        {(showAllCommits ? commits : commits.slice(0, 5)).map((c, i) => <CommitRow key={c.sha} commit={c} index={i} />)}
+                        {commits.length > 5 && (
+                          <button
+                            onClick={() => setShowAllCommits((v) => !v)}
+                            className="w-full py-2.5 text-[11px] text-gray-400 hover:text-gray-600 transition-colors border-t border-gray-100"
+                          >
+                            {showAllCommits ? "Show less" : `View all ${commits.length} commits`}
+                          </button>
+                        )}
+                      </>
                 )}
                 {githubTab === "prs" && (
                   pulls.length === 0
                     ? <p className="text-sm text-gray-400 text-center py-12">No pull requests found</p>
-                    : pulls.map((p, i) => <PRRow key={p.number} pr={p} index={i} />)
+                    : <>
+                        {(showAllPRs ? pulls : pulls.slice(0, 5)).map((p, i) => <PRRow key={p.number} pr={p} index={i} />)}
+                        {pulls.length > 5 && (
+                          <button
+                            onClick={() => setShowAllPRs((v) => !v)}
+                            className="w-full py-2.5 text-[11px] text-gray-400 hover:text-gray-600 transition-colors border-t border-gray-100"
+                          >
+                            {showAllPRs ? "Show less" : `View all ${pulls.length} pull requests`}
+                          </button>
+                        )}
+                      </>
                 )}
               </div>
             )}
             {activeService.service_type === "render" && (() => {
-              const groups = groupByDate(renderDeploys);
+              const week = renderDeploys.filter(d => Date.now() - new Date(d.created_at).getTime() < 7 * 86400000).length;
+              const maxRenderBuildDuration = Math.max(...renderDeploys.filter(d => d.finished_at).map(d => Math.round((new Date(d.finished_at!).getTime() - new Date(d.created_at).getTime()) / 1000)), 1);
+              const live = renderDeploys.filter(d => d.status === "live" || d.status === "deactivated").length;
+              const rate = renderDeploys.length ? Math.round(live / renderDeploys.length * 100) : 0;
+              const withDur = renderDeploys.filter(d => d.finished_at);
+              const avg = withDur.length ? Math.round(withDur.reduce((s, d) => s + (new Date(d.finished_at!).getTime() - new Date(d.created_at).getTime()) / 1000, 0) / withDur.length) : null;
+              let streak = 0;
+              for (const d of renderDeploys) { if (d.status === "live" || d.status === "deactivated") streak++; else break; }
+              const renderUptime = uptimeData[`render:${activeService.resource_id}`];
               return (
                 <>
-                  {/* Chart card */}
-                  <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100 mb-3">
-                    <BuildTrendChart items={renderDeploys.filter(d => d.finished_at).slice(0, 12).reverse().map(d => ({
-                      label: d.commit_id?.slice(0, 5) ?? "—",
-                      duration: Math.round((new Date(d.finished_at!).getTime() - new Date(d.created_at).getTime()) / 1000),
-                      status: d.status,
-                      commit: d.commit_message ?? "",
-                      ts: new Date(d.created_at).getTime(),
-                    }))} />
-                  </div>
-                  {/* Metrics card */}
-                  <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card p-4 mb-3">
-                    <RenderMetricsChart serviceId={activeService.resource_id} />
-                  </div>
-                  {/* Runtime errors */}
-                  {runtimeErrors.length > 0 && (
-                    <div className="bg-white/95 backdrop-blur-[10px] border border-red-200/60 rounded-card shadow-card overflow-hidden divide-y divide-red-50 mb-3">
-                      <div className="px-5 py-2.5 border-b border-red-100 flex items-center gap-2">
-                        <span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" />
-                        <span className="text-[11px] font-semibold text-red-700">Runtime Errors</span>
-                        <span className="ml-auto text-[10px] text-red-400">{runtimeErrors.length} detected</span>
-                      </div>
-                      {runtimeErrors.slice(0, 5).map((err) => (
-                        <div key={err.id} className="px-5 py-3">
-                          <div className="flex items-start justify-between gap-3 mb-1.5">
-                            <span className="text-[12px] font-medium text-gray-800 truncate">{err.subtitle || err.title}</span>
-                            <span className="text-[10px] text-gray-400 whitespace-nowrap shrink-0">
-                              {new Date(err.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                            </span>
-                          </div>
-                          {err.metadata?.errors && err.metadata.errors.length > 1 && (
-                            <div className="mt-1.5 bg-red-50 rounded px-2.5 py-2 font-mono text-[10px] text-red-600 space-y-0.5">
-                              {err.metadata.errors.slice(0, 3).map((line, i) => (
-                                <div key={i} className="truncate">{line}</div>
-                              ))}
-                            </div>
-                          )}
+                  {/* 2 cards side by side */}
+                  <div className="grid grid-cols-2 gap-3 mb-3">
+                    {/* Build trend card */}
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
+                      <BuildTrendChart items={renderDeploys.filter(d => d.finished_at).slice(0, 12).reverse().map(d => ({
+                        label: d.commit_id?.slice(0, 5) ?? "—",
+                        duration: Math.round((new Date(d.finished_at!).getTime() - new Date(d.created_at).getTime()) / 1000),
+                        status: d.status,
+                        commit: d.commit_message ?? "",
+                        ts: new Date(d.created_at).getTime(),
+                      }))} />
+                      <div className={`grid ${streak >= 2 ? "grid-cols-4" : "grid-cols-3"} divide-x divide-gray-100 border-t border-gray-100`}>
+                        <div className="px-4 py-2.5 text-center">
+                          <div className="text-[13px] font-semibold text-gray-900">{week}</div>
+                          <div className="text-[10px] text-gray-400 uppercase tracking-wider mt-0.5">This week</div>
                         </div>
-                      ))}
+                        <div className="px-4 py-2.5 text-center">
+                          <div className={`text-[13px] font-semibold ${rate >= 80 ? "text-emerald-600" : rate >= 50 ? "text-amber-600" : "text-red-500"}`}>{rate}%</div>
+                          <div className="text-[10px] text-gray-400 uppercase tracking-wider mt-0.5">Success</div>
+                        </div>
+                        <div className="px-4 py-2.5 text-center">
+                          <div className="text-[13px] font-semibold text-gray-900">{avg != null ? `${avg}s` : "—"}</div>
+                          <div className="text-[10px] text-gray-400 uppercase tracking-wider mt-0.5">Avg build</div>
+                        </div>
+                        {streak >= 2 && (
+                          <div className="px-4 py-2.5 text-center">
+                            <div className="text-[13px] font-semibold text-emerald-600">{streak} ✓</div>
+                            <div className="text-[10px] text-gray-400 uppercase tracking-wider mt-0.5">Streak</div>
+                          </div>
+                        )}
+                      </div>
+                      {renderUptime && renderUptime.checks.length > 0 && (
+                        <div className="px-5 py-3 border-t border-gray-100">
+                          <div className="flex items-center justify-between mb-1.5">
+                            <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Uptime</p>
+                            <div className="flex items-center gap-3 text-[10px] text-gray-400">
+                              {renderUptime.uptime_pct != null && <span className="font-medium text-gray-600">{renderUptime.uptime_pct}%</span>}
+                              {renderUptime.avg_latency_ms != null && <span>{renderUptime.avg_latency_ms}ms avg</span>}
+                            </div>
+                          </div>
+                          <div className="flex gap-0.5">
+                            {renderUptime.checks.map((c, i) => (
+                              <div key={i} title={`${c.is_up ? "Up" : "Down"} — ${new Date(c.checked_at).toLocaleString()}`}
+                                className={`flex-1 h-5 rounded-sm ${c.is_up ? "bg-emerald-400/70" : "bg-red-400/80"}`} />
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
-                  )}
+                    {/* Metrics card */}
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card p-4">
+                      <RenderMetricsChart serviceId={activeService.resource_id} />
+                    </div>
+                  </div>
 
+                  {/* Deploy history + Errors */}
+                  <div className="grid grid-cols-2 gap-3">
                   {/* Deploy history card */}
                   <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100">
-                    <div className="px-5 py-2.5 border-b border-gray-100">
-                      <span className="text-[11px] font-semibold text-gray-700">Deployment History</span>
+                    <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
+                      <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Deployment History</p>
                     </div>
                     {renderDeploys.length === 0
                       ? <p className="text-sm text-gray-400 text-center py-12">No deploys found</p>
-                      : groups.map((group) => (
-                          <div key={group.label}>
-                            <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
-                              <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{group.label}</span>
-                            </div>
-                            {group.items.map((d, i) => (
-                              <RenderDeployRow
-                                key={d.id}
-                                deploy={d}
-                                index={i}
-                                serviceId={activeService.resource_id}
-                                onViewLogs={(url, subtitle) => setLogDrawer({ logsUrl: url, title: "Deploy Logs", subtitle })}
-                                onRedeploy={async (svcId) => {
-                                  setDeploying(true);
-                                  try {
-                                    const res = await apiFetch("/api/render/deploy", { method: "POST", body: JSON.stringify({ serviceId: svcId }) });
-                                    if (res.ok) { const nd = await res.json(); setRenderDeploys((prev) => [{ ...d, id: nd.id, status: "build_in_progress", created_at: nd.created_at }, ...prev]); }
-                                  } finally { setDeploying(false); }
-                                }}
-                              />
-                            ))}
-                          </div>
-                        ))
+                      : (() => {
+                          const visibleDeploys = showAllDeploys ? renderDeploys : renderDeploys.slice(0, 5);
+                          const visibleGroups = groupByDate(visibleDeploys);
+                          return (
+                            <>
+                              {visibleGroups.map((group) => (
+                                <div key={group.label}>
+                                  <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
+                                    <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{group.label}</span>
+                                  </div>
+                                  {group.items.map((d, i) => (
+                                    <RenderDeployRow
+                                      key={d.id}
+                                      deploy={d}
+                                      index={i}
+                                      serviceId={activeService.resource_id}
+                                      maxBuildDuration={maxRenderBuildDuration}
+                                      onViewLogs={(url, subtitle, isLive) => setLogDrawer({ logsUrl: url, title: "Deploy Logs", subtitle, isLive })}
+                                      onRedeploy={async (svcId, commitId) => {
+                                        setDeploying(true);
+                                        try {
+                                          const res = await apiFetch("/api/render/deploy", { method: "POST", body: JSON.stringify({ serviceId: svcId, ...(commitId ? { commitId } : {}) }) });
+                                          if (res.ok) { const nd = await res.json(); setRenderDeploys((prev) => [{ ...d, id: nd.id, status: "build_in_progress", created_at: nd.created_at }, ...prev]); }
+                                        } finally { setDeploying(false); }
+                                      }}
+                                    />
+                                  ))}
+                                </div>
+                              ))}
+                              {renderDeploys.length > 5 && (
+                                <button
+                                  onClick={() => setShowAllDeploys((v) => !v)}
+                                  className="w-full py-2.5 text-[11px] text-gray-400 hover:text-gray-600 transition-colors border-t border-gray-100"
+                                >
+                                  {showAllDeploys ? "Show less" : `View all ${renderDeploys.length} deploys`}
+                                </button>
+                              )}
+                            </>
+                          );
+                        })()
                     }
                   </div>
+                  {/* Errors card */}
+                  {(() => {
+                    const buildErrors = renderDeploys.filter(d => d.status === "build_failed").slice(0, 5);
+                    const renderRuntimeErrors = runtimeErrors.filter(e => e.service === "render");
+                    const hasErrors = buildErrors.length > 0 || renderRuntimeErrors.length > 0;
+                    return (
+                      <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
+                        <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
+                          <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
+                            Errors {hasErrors && <span className="text-red-500 ml-1">{buildErrors.length + renderRuntimeErrors.length}</span>}
+                          </p>
+                        </div>
+                        {!hasErrors ? (
+                          <div className="px-5 py-8 text-center">
+                            <p className="text-[12px] text-gray-400">No errors detected</p>
+                          </div>
+                        ) : (
+                          <>
+                            {renderRuntimeErrors.length > 0 && (
+                              <>
+                                <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
+                                  <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Runtime</span>
+                                </div>
+                                <div className="divide-y divide-gray-100">
+                                  {renderRuntimeErrors.slice(0, 5).map((e) => (
+                                    <ErrorRow
+                                      key={e.id} id={e.id}
+                                      type="runtime"
+                                      label={e.subtitle || e.title}
+                                      time={new Date(e.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                                      fullTime={new Date(e.timestamp).toLocaleString()}
+                                      details={e.metadata?.errors}
+                                      onOpen={setErrorModal}
+                                    />
+                                  ))}
+                                </div>
+                              </>
+                            )}
+                            {buildErrors.length > 0 && (
+                              <>
+                                <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100 border-t border-t-gray-100">
+                                  <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Build</span>
+                                </div>
+                                <div className="divide-y divide-gray-100">
+                                  {buildErrors.map((d) => (
+                                    <ErrorRow
+                                      key={d.id} id={d.id}
+                                      type="build"
+                                      label="Build failed"
+                                      commit={d.commit_message ?? undefined}
+                                      time={timeAgo(d.created_at)}
+                                      fullTime={new Date(d.created_at).toLocaleString()}
+                                      logsUrl={`/api/render/deploys/${activeService.resource_id}/${d.id}/logs`}
+                                      onOpen={setErrorModal}
+                                    />
+                                  ))}
+                                </div>
+                              </>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    );
+                  })()}
+                  </div>{/* end deploy+errors grid */}
                 </>
               );
             })()}
@@ -1150,11 +1564,15 @@ export default function ProjectPage() {
         </div>
       )}
 
+      {/* Error modal */}
+      {errorModal && <ErrorModal data={errorModal} onClose={() => setErrorModal(null)} />}
+
       {/* Log drawer */}
       <LogDrawer
         logsUrl={logDrawer?.logsUrl ?? null}
         title={logDrawer?.title ?? ""}
         subtitle={logDrawer?.subtitle ?? ""}
+        isLive={logDrawer?.isLive}
         onClose={() => setLogDrawer(null)}
       />
 
