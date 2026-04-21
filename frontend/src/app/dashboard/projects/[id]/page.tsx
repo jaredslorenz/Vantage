@@ -9,8 +9,8 @@ import { groupByDate, timeAgo } from "@/lib/utils";
 import type {
   Project, ProjectService, Deployment, Commit, PullRequest,
   RenderDeploy, VercelProject, GitHubRepo, RenderService,
-  SupabaseProject, SupabaseServiceHealth, SupabaseOverview,
-  DeployAnalysis, UptimeStatus, EnvVar, LogLine, Investigation, RuntimeError,
+  SupabaseProject, SupabaseServiceHealth, SupabaseOverview, SupabaseFunction, SupabaseStorage, SupabaseConfig, SupabaseTraffic, SupabaseTrafficDaily,
+  DeployAnalysis, UptimeStatus, EnvVar, LogLine, RuntimeError,
 } from "@/types/project";
 import { InsightPanel } from "@/components/project/InsightPanel";
 
@@ -22,6 +22,9 @@ import { RenderCard, RenderDeployRow } from "@/components/project/RenderCard";
 import { RenderMetricsChart } from "@/components/project/RenderMetricsChart";
 import { GitHubCard, CommitRow, PRRow } from "@/components/project/GitHubCard";
 import { SupabaseCard, SB_COLOR } from "@/components/project/SupabaseCard";
+import { SupabaseMetricsChart } from "@/components/project/SupabaseMetricsChart";
+import { SupabaseLogsPanel } from "@/components/project/SupabaseLogsPanel";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 
 // --- Log drawer ---
 function LogDrawer({ logsUrl, title, subtitle, isLive, onClose }: {
@@ -34,37 +37,48 @@ function LogDrawer({ logsUrl, title, subtitle, isLive, onClose }: {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const atBottomRef = useRef(true);
 
-  const fetchLogs = (url: string, initial: boolean) => {
-    if (initial) setLoading(true);
-    apiFetch(url)
-      .then((r) => r.json())
-      .then((d) => {
-        setLines(d.lines ?? []);
-        if (initial) setLoading(false);
-      })
-      .catch(() => { if (initial) setLoading(false); });
-  };
-
   useEffect(() => {
     if (!logsUrl) return;
     setLines([]);
     setLive(!!isLive);
-    fetchLogs(logsUrl, true);
-  }, [logsUrl, isLive]);
+    setLoading(true);
 
-  // Poll every 5s when live — grow the window each tick so logs accumulate
-  useEffect(() => {
-    if (!live || !logsUrl) return;
-    let window = 60;
-    const id = setInterval(() => {
-      window += 5;
-      const url = logsUrl.includes("window=")
-        ? logsUrl.replace(/window=\d+/, `window=${window}`)
-        : logsUrl;
-      fetchLogs(url, false);
-    }, 5000);
-    return () => clearInterval(id);
-  }, [live, logsUrl]);
+    if (isLive) {
+      // SSE streaming for live logs
+      const controller = new AbortController();
+      apiFetch(logsUrl, { signal: controller.signal }).then(async (resp) => {
+        if (!resp.ok || !resp.body) { setLoading(false); return; }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        setLoading(false);
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const parts = buf.split("\n\n");
+            buf = parts.pop() ?? "";
+            for (const part of parts) {
+              const dataLine = part.split("\n").find(l => l.startsWith("data:"));
+              if (!dataLine) continue;
+              try {
+                const entry = JSON.parse(dataLine.slice(5).trim());
+                if (entry.text) setLines(prev => [...prev, entry]);
+              } catch { /* ignore malformed */ }
+            }
+          }
+        } catch { /* aborted */ }
+      }).catch(() => setLoading(false));
+      return () => controller.abort();
+    } else {
+      // JSON fetch for static logs
+      apiFetch(logsUrl)
+        .then((r) => r.json())
+        .then((d) => { setLines(d.lines ?? []); setLoading(false); })
+        .catch(() => setLoading(false));
+    }
+  }, [logsUrl, isLive]);
 
   // Track scroll position to know if user is at bottom
   useEffect(() => {
@@ -206,11 +220,19 @@ function LogDrawer({ logsUrl, title, subtitle, isLive, onClose }: {
 type ErrorModalData = { id: string; label: string; fullTime: string; commit?: string; type: "runtime" | "build"; details?: string[]; logsUrl?: string; };
 type AIErrorResult = { error: string; root_cause: string; fix: string };
 const _errorAICache = new Map<string, AIErrorResult>();
+function _getAICache(id: string): AIErrorResult | undefined {
+  if (_errorAICache.has(id)) return _errorAICache.get(id);
+  try { const s = sessionStorage.getItem(`vai_${id}`); if (s) { const r = JSON.parse(s); _errorAICache.set(id, r); return r; } } catch {}
+}
+function _setAICache(id: string, r: AIErrorResult) {
+  _errorAICache.set(id, r);
+  try { sessionStorage.setItem(`vai_${id}`, JSON.stringify(r)); } catch {}
+}
 
 function ErrorModal({ data, onClose }: { data: ErrorModalData; onClose: () => void }) {
   const [lines, setLines] = useState<string[]>(data.details ?? []);
   const [loading, setLoading] = useState(false);
-  const [ai, setAi] = useState<AIErrorResult | null>(_errorAICache.get(data.id) ?? null);
+  const [ai, setAi] = useState<AIErrorResult | null>(_getAICache(data.id) ?? null);
   const [aiLoading, setAiLoading] = useState(false);
 
   useEffect(() => {
@@ -239,7 +261,7 @@ function ErrorModal({ data, onClose }: { data: ErrorModalData; onClose: () => vo
 
   // Fire AI analysis once logs are ready, skip if cached
   useEffect(() => {
-    if (_errorAICache.has(data.id)) return;
+    if (_getAICache(data.id)) return;
     if (loading) return;
     if (lines.length === 0) return;
     setAiLoading(true);
@@ -249,7 +271,7 @@ function ErrorModal({ data, onClose }: { data: ErrorModalData; onClose: () => vo
     })
       .then(r => r.json())
       .then((result: AIErrorResult) => {
-        _errorAICache.set(data.id, result);
+        _setAICache(data.id, result);
         setAi(result);
       })
       .catch(() => {})
@@ -392,7 +414,11 @@ export default function ProjectPage() {
   const [supabaseProjects, setSupabaseProjects] = useState<SupabaseProject[]>([]);
   const [supabaseHealth, setSupabaseHealth] = useState<SupabaseServiceHealth[]>([]);
   const [supabaseOverview, setSupabaseOverview] = useState<SupabaseOverview | null>(null);
-  const [supabaseTab, setSupabaseTab] = useState<"overview" | "logs" | "history">("overview");
+  const [supabaseFunctions, setSupabaseFunctions] = useState<SupabaseFunction[]>([]);
+  const [supabaseStorage, setSupabaseStorage] = useState<SupabaseStorage | null>(null);
+  const [supabaseConfig, setSupabaseConfig] = useState<SupabaseConfig | null>(null);
+  const [supabaseTraffic, setSupabaseTraffic] = useState<SupabaseTraffic | null>(null);
+  const [supabaseTrafficDaily, setSupabaseTrafficDaily] = useState<SupabaseTrafficDaily | null>(null);
   const [loading, setLoading] = useState(true);
   const [selectedService, setSelectedService] = useState<string | null>(null);
   const [showLinkPanel, setShowLinkPanel] = useState(false);
@@ -409,16 +435,15 @@ export default function ProjectPage() {
   const [envVars, setEnvVars] = useState<EnvVar[]>([]);
   const [envVarsLoaded, setEnvVarsLoaded] = useState(false);
   const [proactiveAlerts, setProactiveAlerts] = useState<Record<string, DeployAnalysis>>({});
-  const [investigation, setInvestigation] = useState<Investigation | null>(null);
-  const [investigating, setInvestigating] = useState(false);
   const [runtimeErrors, setRuntimeErrors] = useState<RuntimeError[]>([]);
+  const [lastFetchedAt, setLastFetchedAt] = useState<number | null>(null);
+  const [confirmDeploy, setConfirmDeploy] = useState(false);
   const [showAllDeploys, setShowAllDeploys] = useState(false);
   const [showAllVercel, setShowAllVercel] = useState(false);
   const [showAllCommits, setShowAllCommits] = useState(false);
   const [showAllPRs, setShowAllPRs] = useState(false);
   const prevVercelStates = useRef<Record<string, string>>({});
   const prevRenderStates = useRef<Record<string, string>>({});
-  const autoInvestigated = useRef(false);
 
   useEffect(() => {
     apiFetch(`/api/projects/${id}`)
@@ -465,13 +490,23 @@ export default function ProjectPage() {
             apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/health`)
               .then((r) => r.json()).then((d) => setSupabaseHealth(d.services ?? [])).catch(() => {}),
             apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/overview`)
-              .then((r) => r.json()).then((d) => setSupabaseOverview(d)).catch(() => {})
+              .then((r) => r.json()).then((d) => setSupabaseOverview(d)).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/functions`)
+              .then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseFunctions(d.functions ?? []); }).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/storage`)
+              .then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseStorage(d); }).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/config`)
+              .then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseConfig(d); }).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/traffic`)
+              .then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseTraffic(d); }).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/traffic/daily`)
+              .then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseTrafficDaily(d); }).catch(() => {})
           );
         }
         return Promise.all(fetches);
       })
       .catch(() => {})
-      .finally(() => setLoading(false));
+      .finally(() => { setLoading(false); setLastFetchedAt(Date.now()); });
   }, [id]);
 
   // Supabase Realtime — refresh data when scheduler writes new events for this project
@@ -535,22 +570,6 @@ export default function ProjectPage() {
           .then((r) => r.json())
           .then((d) => {
             const newDeploys = d.deployments ?? [];
-            // Auto-investigate when a build goes BUILDING → ERROR
-            const justFailed = (newDeploys as { id: string; state: string }[]).some(
-              (dep) => prevVercelStates.current[dep.id] === "BUILDING" && dep.state === "ERROR"
-            );
-            if (justFailed) {
-              setInvestigating(true);
-              setInvestigation(null);
-              apiFetch("/api/insights/investigate", {
-                method: "POST",
-                body: JSON.stringify({ project_id: project?.id, service_type: "vercel" }),
-              })
-                .then((r) => r.json())
-                .then((data) => setInvestigation(data))
-                .catch(() => {})
-                .finally(() => setInvestigating(false));
-            }
             const settled = newDeploys.some(
               (dep: { id: string; state: string }) =>
                 prevVercelStates.current[dep.id] === "BUILDING" &&
@@ -567,25 +586,8 @@ export default function ProjectPage() {
           .then((r) => r.json())
           .then((d) => {
             const newDeploys = d.deploys ?? [];
-            const justFailed = newDeploys.some(
-              (dep: { id: string; status: string }) =>
-                ["build_in_progress", "update_in_progress", "pre_deploy_in_progress"].includes(prevRenderStates.current[dep.id]) &&
-                dep.status === "build_failed"
-            );
             prevRenderStates.current = Object.fromEntries(newDeploys.map((dep: { id: string; status: string }) => [dep.id, dep.status]));
             setRenderDeploys(newDeploys);
-            if (justFailed) {
-              setInvestigating(true);
-              setInvestigation(null);
-              apiFetch("/api/insights/investigate", {
-                method: "POST",
-                body: JSON.stringify({ project_id: project?.id, service_type: "render" }),
-              })
-                .then((r) => r.json())
-                .then((data) => setInvestigation(data))
-                .catch(() => {})
-                .finally(() => setInvestigating(false));
-            }
           })
           .catch(() => {});
       }
@@ -594,43 +596,6 @@ export default function ProjectPage() {
     return () => clearInterval(interval);
   }, [deployments, renderDeploys, project]);
 
-  // Auto-investigate on page load if failures detected
-  useEffect(() => {
-    if (loading || autoInvestigated.current || !project) return;
-    const renderSvc = project.project_services.find((s) => s.service_type === "render");
-    const vercelSvc = project.project_services.find((s) => s.service_type === "vercel");
-    const supabaseSvc = project.project_services.find((s) => s.service_type === "supabase");
-    let failingService: string | null = null;
-    if (renderSvc && renderDeploys.length >= 3 && renderDeploys[0]?.status === "build_failed") {
-      const rate = Math.round(renderDeploys.filter((d) => d.status === "live").length / renderDeploys.length * 100);
-      if (rate < 50) failingService = "render";
-    }
-    if (!failingService && vercelSvc && deployments.length >= 3 && deployments[0]?.state === "ERROR") {
-      const rate = Math.round(deployments.filter((d) => d.state === "READY").length / deployments.length * 100);
-      if (rate < 50) failingService = "vercel";
-    }
-    if (!failingService && supabaseSvc && supabaseHealth.some((s) => s.status === "ACTIVE_UNHEALTHY")) {
-      failingService = "supabase";
-    }
-    if (!failingService && renderSvc && runtimeErrors.some(e => e.service === "render")) {
-      failingService = "render";
-    }
-    if (!failingService && vercelSvc && runtimeErrors.some(e => e.service === "vercel")) {
-      failingService = "vercel";
-    }
-    if (!failingService) return;
-    autoInvestigated.current = true;
-    setInvestigating(true);
-    setInvestigation(null);
-    apiFetch("/api/insights/investigate", {
-      method: "POST",
-      body: JSON.stringify({ project_id: project.id, service_type: failingService }),
-    })
-      .then((r) => r.json())
-      .then((data) => setInvestigation(data))
-      .catch(() => {})
-      .finally(() => setInvestigating(false));
-  }, [loading, deployments, renderDeploys, supabaseHealth, runtimeErrors.length, project]);
 
   // Uptime checks — fire once when we have deployment URLs to ping
   useEffect(() => {
@@ -709,6 +674,11 @@ export default function ProjectPage() {
           await Promise.all([
             apiFetch(`/api/supabase/projects/${resourceId}/health`).then((r) => r.json()).then((d) => setSupabaseHealth(d.services ?? [])).catch(() => {}),
             apiFetch(`/api/supabase/projects/${resourceId}/overview`).then((r) => r.json()).then((d) => setSupabaseOverview(d)).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${resourceId}/functions`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseFunctions(d.functions ?? []); }).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${resourceId}/storage`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseStorage(d); }).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${resourceId}/config`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseConfig(d); }).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${resourceId}/traffic`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseTraffic(d); }).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${resourceId}/traffic/daily`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseTrafficDaily(d); }).catch(() => {}),
           ]);
         } else {
           await apiFetch(`/api/vercel/deployments?limit=20&projectId=${resourceId}`).then((r) => r.json()).then((d) => setDeployments(d.deployments ?? [])).catch(() => {});
@@ -737,7 +707,7 @@ export default function ProjectPage() {
         if (!latest) return;
         const res = await apiFetch("/api/vercel/redeploy", {
           method: "POST",
-          body: JSON.stringify({ deploymentId: latest.id }),
+          body: JSON.stringify({ deploymentId: latest.id, projectId: activeService.resource_id }),
         });
         if (res.ok) {
           const newDeploy = await res.json();
@@ -755,7 +725,7 @@ export default function ProjectPage() {
     if (serviceType === "vercel") setDeployments([]);
     if (serviceType === "github") { setCommits([]); setPulls([]); }
     if (serviceType === "render") setRenderDeploys([]);
-    if (serviceType === "supabase") { setSupabaseHealth([]); setSupabaseOverview(null); }
+    if (serviceType === "supabase") { setSupabaseHealth([]); setSupabaseOverview(null); setSupabaseFunctions([]); setSupabaseStorage(null); setSupabaseConfig(null); setSupabaseTraffic(null); setSupabaseTrafficDaily(null); }
   };
 
 
@@ -837,18 +807,6 @@ export default function ProjectPage() {
         <InsightPanel
           projectId={project.id}
           runtimeErrors={runtimeErrors}
-          investigation={investigation}
-          investigating={investigating}
-          onInvestigate={(serviceType) => {
-            const svc = project.project_services.find((s) => s.service_type === serviceType);
-            if (!svc) return;
-            setInvestigating(true);
-            apiFetch(`/api/insights/investigate?project_id=${project.id}&service_type=${serviceType}&service_id=${svc.resource_id}`)
-              .then((r) => r.json())
-              .then((data) => setInvestigation(data))
-              .catch(() => {})
-              .finally(() => setInvestigating(false));
-          }}
         />
       )}
 
@@ -880,7 +838,7 @@ export default function ProjectPage() {
               return <RenderCard key={svc.id} service={svc} deploys={renderDeploys} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} hasRuntimeErrors={runtimeErrors.some(e => e.service === "render")} uptime={uptimeData[`render:${svc.resource_id}`]} onInvestigate={() => setSelectedService(svc.id)} />;
             }
             if (svc.service_type === "supabase") {
-              return <SupabaseCard key={svc.id} service={svc} health={supabaseHealth} overview={supabaseOverview} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} />;
+              return <SupabaseCard key={svc.id} service={svc} health={supabaseHealth} overview={supabaseOverview} selected={selectedService === svc.id} onClick={() => setSelectedService(selectedService === svc.id ? null : svc.id)} onUnlink={() => handleUnlink(svc.id, svc.service_type)} hasRuntimeErrors={runtimeErrors.some(e => e.service === "supabase")} />;
             }
             return null;
           })}
@@ -905,16 +863,9 @@ export default function ProjectPage() {
                   ))}
                 </div>
               ) : activeService.service_type === "supabase" ? (
-                <div className="flex gap-1 bg-white/20 rounded-button p-0.5">
-                  {(["overview", "logs", "history"] as const).map((tab) => (
-                    <button
-                      key={tab}
-                      onClick={() => setSupabaseTab(tab)}
-                      className={`text-[11px] font-medium px-3 py-1 rounded-button transition-all capitalize ${supabaseTab === tab ? "bg-white text-gray-900 shadow-sm" : "text-white/60 hover:text-white"}`}
-                    >
-                      {tab === "logs" ? `Errors` : tab === "history" ? "Actions" : "Overview"}
-                    </button>
-                  ))}
+                <div>
+                  <h2 className="text-xs font-semibold text-white/80 uppercase tracking-wider">Supabase</h2>
+                  <p className="text-[11px] text-white/40 mt-0.5">{activeService.resource_name}</p>
                 </div>
               ) : activeService.service_type === "vercel" ? (
                 <div className="flex gap-1 bg-white/20 rounded-button p-0.5">
@@ -936,31 +887,48 @@ export default function ProjectPage() {
               )}
             </div>
             <div className="flex items-center gap-3">
-              {(activeService.service_type === "vercel" || activeService.service_type === "render") && (
-                <button
-                  onClick={handleDeploy}
-                  disabled={deploying}
-                  className="flex items-center gap-1.5 text-[11px] font-medium px-3 py-1 rounded-button bg-white/20 backdrop-blur text-white hover:bg-white/30 transition-all border border-white/30 disabled:opacity-50"
-                >
-                  {deploying ? (
-                    <>
-                      <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
-                      </svg>
-                      Deploying...
-                    </>
-                  ) : (
-                    <>
-                      <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                        <path d="M5 12h14M12 5l7 7-7 7" />
-                      </svg>
-                      {activeService.service_type === "vercel" ? "Redeploy" : "Deploy"}
-                    </>
-                  )}
-                </button>
+              {lastFetchedAt && (
+                <span className="text-[10px] text-white/40 tabular-nums">{timeAgo(lastFetchedAt)}</span>
               )}
-              <button onClick={() => handleUnlink(activeService.id, activeService.service_type)} className="text-[11px] text-white/30 hover:text-red-300 transition-colors">
+              {(activeService.service_type === "vercel" || activeService.service_type === "render") && (
+                confirmDeploy ? (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] text-white/70">Sure?</span>
+                    <button
+                      onClick={() => { setConfirmDeploy(false); handleDeploy(); }}
+                      className="text-[11px] font-medium px-2.5 py-1 rounded-button bg-white/30 text-white hover:bg-white/40 transition-all border border-white/40"
+                    >Yes</button>
+                    <button
+                      onClick={() => setConfirmDeploy(false)}
+                      className="text-[11px] font-medium px-2.5 py-1 rounded-button text-white/60 hover:text-white transition-colors"
+                    >Cancel</button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setConfirmDeploy(true)}
+                    disabled={deploying}
+                    className="flex items-center gap-1.5 text-[11px] font-medium px-3 py-1 rounded-button bg-white/20 backdrop-blur text-white hover:bg-white/30 transition-all border border-white/30 disabled:opacity-50"
+                  >
+                    {deploying ? (
+                      <>
+                        <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                        </svg>
+                        Deploying...
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                          <path d="M5 12h14M12 5l7 7-7 7" />
+                        </svg>
+                        {activeService.service_type === "vercel" ? "Redeploy" : "Deploy"}
+                      </>
+                    )}
+                  </button>
+                )
+              )}
+              <button onClick={() => handleUnlink(activeService.id, activeService.service_type)} className="text-[11px] font-medium px-3 py-1 rounded-button border border-red-400/60 text-red-400 hover:bg-red-400/10 transition-all">
                 Unlink
               </button>
             </div>
@@ -1137,16 +1105,11 @@ export default function ProjectPage() {
                                       maxBuildDuration={maxBuildDuration}
                                       githubRepo={githubSvc?.resource_id}
                                       initialAnalysis={proactiveAlerts[d.id]}
-                                      onViewLogs={(depId, name) => setLogDrawer({
-                                        logsUrl: `/api/vercel/logs/${depId}/runtime?window=300`,
-                                        title: "Runtime Logs",
-                                        subtitle: name,
-                                        isLive: true,
-                                      })}
+                                      projectId={activeService?.resource_id}
                                       onRedeploy={async (depId) => {
                                         setDeploying(true);
                                         try {
-                                          const res = await apiFetch("/api/vercel/redeploy", { method: "POST", body: JSON.stringify({ deploymentId: depId }) });
+                                          const res = await apiFetch("/api/vercel/redeploy", { method: "POST", body: JSON.stringify({ deploymentId: depId, projectId: activeService?.resource_id }) });
                                           if (res.ok) {
                                             const nd = await res.json();
                                             setDeployments((prev) => [{ ...d, id: nd.id, state: "BUILDING", created_at: Date.now() }, ...prev]);
@@ -1222,7 +1185,7 @@ export default function ProjectPage() {
                                       commit={d.commit_message ?? undefined}
                                       time={new Date(d.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                                       fullTime={new Date(d.created_at).toLocaleString()}
-                                      logsUrl={`/api/vercel/deployments/${d.id}/logs`}
+                                      logsUrl={`/api/vercel/deployments/${d.id}/logs?projectId=${activeService?.resource_id}`}
                                       onOpen={setErrorModal}
                                     />
                                   ))}
@@ -1393,13 +1356,15 @@ export default function ProjectPage() {
                   {/* Errors card */}
                   {(() => {
                     const buildErrors = renderDeploys.filter(d => d.status === "build_failed").slice(0, 5);
-                    const renderRuntimeErrors = runtimeErrors.filter(e => e.service === "render");
-                    const hasErrors = buildErrors.length > 0 || renderRuntimeErrors.length > 0;
+                    const allRenderErrors = runtimeErrors.filter(e => e.service === "render");
+                    const metricAlerts = allRenderErrors.filter(e => e.metadata?.alert_type);
+                    const renderRuntimeErrors = allRenderErrors.filter(e => !e.metadata?.alert_type);
+                    const hasErrors = buildErrors.length > 0 || allRenderErrors.length > 0;
                     return (
                       <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
                         <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
                           <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
-                            Errors {hasErrors && <span className="text-red-500 ml-1">{buildErrors.length + renderRuntimeErrors.length}</span>}
+                            Errors {hasErrors && <span className="text-red-500 ml-1">{buildErrors.length + allRenderErrors.length}</span>}
                           </p>
                         </div>
                         {!hasErrors ? (
@@ -1408,6 +1373,36 @@ export default function ProjectPage() {
                           </div>
                         ) : (
                           <>
+                            {metricAlerts.length > 0 && (
+                              <>
+                                <div className="px-5 py-1.5 bg-amber-50/80 border-b border-amber-100">
+                                  <span className="text-[10px] font-semibold text-amber-600 uppercase tracking-wider">Resource Alerts</span>
+                                </div>
+                                <div className="divide-y divide-gray-100">
+                                  {metricAlerts.map((e) => (
+                                    <div key={e.id} className="px-5 py-3 flex items-center gap-3">
+                                      <span className="text-base shrink-0">{e.metadata?.alert_type === "memory" ? "🧠" : "⚡"}</span>
+                                      <div className="flex-1 min-w-0">
+                                        <p className="text-[12px] font-medium text-gray-800">{e.title}</p>
+                                        <p className="text-[11px] text-gray-500 truncate">{e.subtitle}</p>
+                                      </div>
+                                      {e.metadata?.mem_pct !== undefined && (
+                                        <div className="shrink-0 text-right">
+                                          <div className={`text-[13px] font-bold ${e.metadata.mem_pct > 90 ? "text-red-500" : "text-amber-500"}`}>{e.metadata.mem_pct}%</div>
+                                          <div className="text-[9px] text-gray-400 uppercase">{e.metadata.mem_mb} MB / {e.metadata.limit_mb} MB</div>
+                                        </div>
+                                      )}
+                                      {e.metadata?.cpu_pct !== undefined && (
+                                        <div className="shrink-0 text-right">
+                                          <div className={`text-[13px] font-bold ${e.metadata.cpu_pct > 90 ? "text-red-500" : "text-amber-500"}`}>{e.metadata.cpu_pct}%</div>
+                                          <div className="text-[9px] text-gray-400 uppercase">{e.metadata.cpu_mcpu} mCPU</div>
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              </>
+                            )}
                             {renderRuntimeErrors.length > 0 && (
                               <>
                                 <div className="px-5 py-1.5 bg-gray-50/80 border-b border-gray-100">
@@ -1458,108 +1453,404 @@ export default function ProjectPage() {
                 </>
               );
             })()}
-            {activeService.service_type === "supabase" && (
-              <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden divide-y divide-gray-100">
-                {supabaseTab === "overview" && (
-                  <>
-                    <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
-                      <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Services</p>
-                      <div className="flex flex-wrap gap-3">
-                        {supabaseHealth.length === 0
-                          ? <p className="text-[12px] text-gray-400">Loading…</p>
-                          : supabaseHealth.map((s) => (
-                              <div key={s.name} className="flex items-center gap-1.5">
-                                <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: SB_COLOR[s.status] ?? "#d1d5db" }} />
-                                <span className="text-[12px] text-gray-600 capitalize">{s.name.replace(/_/g, " ")}</span>
-                              </div>
-                            ))
-                        }
+            {activeService.service_type === "supabase" && (() => {
+              const supabaseSvc = project.project_services.find((s) => s.service_type === "supabase");
+              const healthyCount = supabaseHealth.filter((s) => s.status === "ACTIVE_HEALTHY").length;
+              const totalRequests = supabaseOverview?.api_stats.reduce((sum, p) => sum + p.count, 0) ?? null;
+              const errorCount = supabaseOverview?.error_logs.length ?? null;
+              const PROVIDER_ICONS: Record<string, string> = {
+                email: "✉", phone: "📱", google: "G", github: "⌥", gitlab: "🦊",
+                discord: "◎", apple: "⌘", twitter: "𝕏", facebook: "f", slack: "s",
+                spotify: "♪", twitch: "t", azure: "Az", bitbucket: "⚙", notion: "N",
+                zoom: "z", keycloak: "🔑",
+              };
+              return (
+                <div className="space-y-3">
+                  {/* Row 0: Project config + Auth providers */}
+                  <div className="grid grid-cols-2 gap-3">
+                    {/* Project details */}
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
+                      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
+                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Project</p>
                       </div>
-                    </div>
-                    {supabaseOverview?.available.api_stats === false ? (
-                      <div className="px-5 py-4 text-[12px] text-gray-400">API stats not available for this plan</div>
-                    ) : !supabaseOverview ? (
-                      <div className="px-5 py-4 text-[12px] text-gray-400">Loading…</div>
-                    ) : supabaseOverview.api_stats.length === 0 ? (
-                      <div className="px-5 py-4 text-[12px] text-gray-400">No API traffic data yet</div>
-                    ) : (
-                      <div className="px-5 pt-3 pb-1">
-                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">API Requests — Last 7 Days</p>
-                        <div className="flex items-end gap-1 h-16">
-                          {(() => {
-                            const max = Math.max(...supabaseOverview.api_stats.map((p) => p.count), 1);
-                            return supabaseOverview.api_stats.slice(-7).map((point, i) => (
-                              <div key={i} className="flex-1 flex flex-col items-center gap-1 group relative">
-                                <div
-                                  className="w-full rounded-sm bg-brand-purple/40 hover:bg-brand-purple/70 transition-colors"
-                                  style={{ height: `${Math.max(4, (point.count / max) * 56)}px` }}
-                                />
-                                <span className="text-[9px] text-gray-400 tabular-nums">
-                                  {point.count >= 1000 ? `${(point.count / 1000).toFixed(1)}k` : point.count}
-                                </span>
-                                <div suppressHydrationWarning className="absolute -top-6 left-1/2 -translate-x-1/2 bg-gray-800 text-white text-[10px] px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
-                                  {new Date(point.timestamp).toLocaleDateString("en-US", { month: "short", day: "numeric" })}: {point.count.toLocaleString()}
-                                </div>
-                              </div>
-                            ));
-                          })()}
+                      {!supabaseConfig ? (
+                        <div className="space-y-2 px-5 py-3 animate-pulse">{[0,1,2].map(i => <div key={i} className="h-5 bg-gray-50 rounded" />)}</div>
+                      ) : (
+                        <div className="px-5 py-3 space-y-2.5">
+                          {[
+                            { label: "Region", value: supabaseConfig.project?.region ?? null },
+                            { label: "DB Host", value: supabaseConfig.project?.db_host ?? null, mono: true },
+                            { label: "Status", value: supabaseConfig.project?.status?.replace(/_/g, " ") ?? null },
+                            { label: "Created", value: supabaseConfig.project?.created_at ? new Date(supabaseConfig.project.created_at).toLocaleDateString() : null },
+                          ].map(({ label, value, mono }) => (
+                            <div key={label} className="flex items-center justify-between gap-3">
+                              <span className="text-[10px] text-gray-400 uppercase tracking-wider shrink-0">{label}</span>
+                              <span className={`text-[11px] text-gray-700 truncate ${mono ? "font-mono" : "font-medium"}`}>{value ?? "—"}</span>
+                            </div>
+                          ))}
                         </div>
-                      </div>
-                    )}
-                  </>
-                )}
-                {supabaseTab === "logs" && (
-                  !supabaseOverview ? (
-                    <p className="text-sm text-gray-400 text-center py-12">Loading…</p>
-                  ) : supabaseOverview.available.logs === false ? (
-                    <p className="text-sm text-gray-400 text-center py-12">Log access not available for this plan</p>
-                  ) : supabaseOverview.error_logs.length === 0 ? (
-                    <div className="flex flex-col items-center py-12 gap-2">
-                      <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                      <p className="text-sm text-gray-400">No errors in the last 24h</p>
+                      )}
                     </div>
-                  ) : supabaseOverview.error_logs.map((log, i) => (
-                    <div key={i} className="px-5 py-3 border-b border-gray-100 last:border-0 hover:bg-gray-50/40 transition-colors">
-                      <div className="flex items-center gap-2 mb-1">
-                        {log.status && (
-                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${log.status >= 500 ? "text-red-600 bg-red-50" : "text-amber-600 bg-amber-50"}`}>
-                            {log.status}
+
+                    {/* Auth providers */}
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
+                      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
+                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Auth</p>
+                        {supabaseConfig?.auth && (
+                          <div className="flex items-center gap-2">
+                            {supabaseConfig.auth.mfa_enabled && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-brand-purple/10 text-brand-purple">MFA</span>}
+                            {supabaseConfig.auth.anonymous_sign_ins && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-500">Anon</span>}
+                          </div>
+                        )}
+                      </div>
+                      {!supabaseConfig ? (
+                        <div className="space-y-2 px-5 py-3 animate-pulse">{[0,1].map(i => <div key={i} className="h-8 bg-gray-50 rounded" />)}</div>
+                      ) : (
+                        <div className="px-5 py-3 space-y-3">
+                          {supabaseConfig.auth?.site_url && (
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[10px] text-gray-400 uppercase tracking-wider shrink-0">Site URL</span>
+                              <span className="text-[11px] text-gray-600 font-mono truncate">{supabaseConfig.auth.site_url}</span>
+                            </div>
+                          )}
+                          {supabaseConfig.auth?.min_password_length != null && (
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[10px] text-gray-400 uppercase tracking-wider shrink-0">Min Password</span>
+                              <span className="text-[11px] text-gray-700 font-medium">{supabaseConfig.auth.min_password_length} chars</span>
+                            </div>
+                          )}
+                          <div>
+                            <p className="text-[10px] text-gray-400 uppercase tracking-wider mb-1.5">Providers</p>
+                            {(supabaseConfig.auth?.providers ?? []).length === 0 ? (
+                              <p className="text-[11px] text-gray-400">No external providers enabled</p>
+                            ) : (
+                              <div className="flex flex-wrap gap-1.5">
+                                {(supabaseConfig.auth?.providers ?? []).map((p) => (
+                                  <span key={p} className="flex items-center gap-1 text-[10px] font-medium px-2 py-1 rounded-full bg-gray-100 text-gray-600 capitalize">
+                                    <span className="text-[9px]">{PROVIDER_ICONS[p] ?? "○"}</span>
+                                    {p}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Row 1: Services + Infrastructure */}
+                  <div className="grid grid-cols-2 gap-3">
+                    {/* Services — enriched with per-service traffic breakdown */}
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden flex flex-col">
+                      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
+                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Services</p>
+                        {supabaseHealth.length > 0 && (
+                          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${healthyCount === supabaseHealth.length ? "bg-emerald-50 text-emerald-600" : "bg-red-50 text-red-500"}`}>
+                            {healthyCount}/{supabaseHealth.length} healthy
                           </span>
                         )}
-                        <span suppressHydrationWarning className="text-[11px] text-gray-400 shrink-0">
-                          {new Date(log.timestamp).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}
+                      </div>
+                      <div className="divide-y divide-gray-100 flex-1">
+                        {supabaseHealth.length === 0
+                          ? <div className="px-5 py-3 animate-pulse space-y-2">{[0,1,2,3].map(i => <div key={i} className="h-10 bg-gray-50 rounded-lg" />)}</div>
+                          : (() => {
+                              return supabaseHealth.map((s) => {
+                                const slug = s.name === "db" ? "database" : s.name;
+                                const traffic = supabaseTraffic?.breakdown.find(t => t.service === slug);
+                                const errRate = traffic && traffic.total > 0 ? Math.round((traffic.errors / traffic.total) * 100) : 0;
+                                return (
+                                  <div key={s.name} className={`px-4 py-3 ${s.status === "ACTIVE_UNHEALTHY" ? "bg-red-50/40" : ""}`}>
+                                    <div className="flex items-center gap-2.5 mb-1.5">
+                                      <span className="w-2 h-2 rounded-full shrink-0" style={{ background: SB_COLOR[s.status] ?? "#d1d5db" }} />
+                                      <span className="text-[12px] font-semibold text-gray-700 capitalize flex-1">{s.name.replace(/_/g, " ")}</span>
+                                      {traffic ? (
+                                        <div className="flex items-center gap-2 shrink-0">
+                                          <span className="text-[11px] font-semibold text-gray-800">
+                                            {traffic.total >= 1000 ? `${(traffic.total/1000).toFixed(1)}k` : traffic.total}
+                                            <span className="text-[9px] font-normal text-gray-400 ml-0.5">req</span>
+                                          </span>
+                                          {traffic.errors > 0 ? (
+                                            <span className="text-[10px] font-semibold text-red-500 bg-red-50 border border-red-100 px-1.5 py-0.5 rounded-full">
+                                              {errRate > 0 ? `${errRate}%` : traffic.errors} err
+                                            </span>
+                                          ) : (
+                                            <span className="text-[10px] text-emerald-500">✓</span>
+                                          )}
+                                        </div>
+                                      ) : (
+                                        <span className={`text-[10px] font-medium shrink-0 ${
+                                          s.status === "ACTIVE_HEALTHY" ? "text-emerald-500" :
+                                          s.status === "ACTIVE_UNHEALTHY" ? "text-red-500" :
+                                          s.status === "COMING_UP" ? "text-amber-500" : "text-gray-400"
+                                        }`}>{s.status === "ACTIVE_HEALTHY" ? "healthy" : s.status === "ACTIVE_UNHEALTHY" ? "unhealthy" : s.status === "COMING_UP" ? "starting" : "inactive"}</span>
+                                      )}
+                                    </div>
+                                    {(() => {
+                                      // Scaffold last 7 days so chart always fills the full width
+                                      const last7 = Array.from({ length: 7 }, (_, i) => {
+                                        const d = new Date();
+                                        d.setDate(d.getDate() - (6 - i));
+                                        return d.toISOString().slice(0, 10);
+                                      });
+                                      const dailyMap = Object.fromEntries(
+                                        (supabaseTrafficDaily?.services?.[slug] ?? []).map((r) => [r.day, r])
+                                      );
+                                      const sparkData = last7.map((iso) => ({
+                                        day: new Date(iso + "T12:00:00").toLocaleDateString("en-US", { weekday: "short" }),
+                                        total: dailyMap[iso]?.total ?? 0,
+                                        errors: dailyMap[iso]?.errors ?? 0,
+                                      }));
+                                      const hasAny = sparkData.some((d) => d.total > 0);
+                                      if (!hasAny) return null;
+                                      return (
+                                        <div className="ml-4 mt-1.5">
+                                          <ResponsiveContainer width="100%" height={52}>
+                                            <BarChart data={sparkData} margin={{ top: 2, right: 0, left: 0, bottom: 0 }} barCategoryGap="25%">
+                                              <XAxis dataKey="day" tick={{ fontSize: 9, fill: "#9ca3af" }} axisLine={false} tickLine={false} />
+                                              <Bar dataKey="total" stackId="s" fill="#6f7bf7" fillOpacity={0.4} radius={[0,0,0,0]} />
+                                              <Bar dataKey="errors" stackId="s" fill="#f87171" fillOpacity={0.85} radius={[2,2,0,0]} />
+                                              <Tooltip
+                                                contentStyle={{ fontSize: 10, borderRadius: 6, border: "1px solid #e5e7eb", padding: "2px 8px" }}
+                                                formatter={(v, name) => [Number(v).toLocaleString(), name === "errors" ? "Errors" : "Requests"]}
+                                                labelFormatter={(l) => l}
+                                              />
+                                            </BarChart>
+                                          </ResponsiveContainer>
+                                        </div>
+                                      );
+                                    })()}
+                                  </div>
+                                );
+                              });
+                            })()
+                        }
+                      </div>
+                      {supabaseTraffic?.available && supabaseTraffic.breakdown.length > 0 && (
+                        <div className="px-5 py-2.5 border-t border-gray-100 bg-gray-50/40 flex items-center justify-between">
+                          <span className="text-[10px] text-gray-400">Total (24h)</span>
+                          <span className="text-[11px] font-semibold text-gray-700">
+                            {(() => { const t = supabaseTraffic.breakdown.reduce((s, r) => s + r.total, 0); return t >= 1000 ? `${(t/1000).toFixed(1)}k` : t; })()} req
+                            {supabaseTraffic.breakdown.some(r => r.errors > 0) && (
+                              <span className="ml-2 text-red-500">
+                                / {supabaseTraffic.breakdown.reduce((s, r) => s + r.errors, 0)} err
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Infrastructure */}
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card p-5 overflow-y-auto">
+                      {supabaseSvc
+                        ? <SupabaseMetricsChart projectRef={supabaseSvc.resource_id} />
+                        : <p className="text-[12px] text-gray-400">No Supabase project linked</p>
+                      }
+                    </div>
+                  </div>
+
+                  {/* Row 2: API Traffic + Error Logs */}
+                  <div className="grid grid-cols-2 gap-3">
+                    {/* API Traffic */}
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden flex flex-col">
+                      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
+                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">API Traffic</p>
+                        <span className="text-[10px] text-gray-400">
+                          {supabaseTraffic?.available ? "Last 24h by service" : "Last 7 days"}
                         </span>
                       </div>
-                      <p className="text-[12px] text-gray-700 font-mono truncate">{log.message || "—"}</p>
-                    </div>
-                  ))
-                )}
-                {supabaseTab === "history" && (
-                  !supabaseOverview ? (
-                    <p className="text-sm text-gray-400 text-center py-12">Loading…</p>
-                  ) : supabaseOverview.available.actions === false ? (
-                    <p className="text-sm text-gray-400 text-center py-12">Action history not available</p>
-                  ) : supabaseOverview.actions.length === 0 ? (
-                    <p className="text-sm text-gray-400 text-center py-12">No actions found</p>
-                  ) : supabaseOverview.actions.map((action) => (
-                    <div key={action.id} className="flex items-center justify-between px-5 py-3.5 border-b border-gray-100 last:border-0">
-                      <div className="flex items-center gap-2.5">
-                        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
-                          action.status === "COMPLETED" ? "text-emerald-600 bg-emerald-50" :
-                          action.status === "FAILED" ? "text-red-500 bg-red-50" :
-                          action.status === "IN_PROGRESS" ? "text-amber-500 bg-amber-50" :
-                          "text-gray-500 bg-gray-100"
-                        }`}>{action.status}</span>
-                        {action.error_message && (
-                          <span className="text-[12px] text-gray-500 truncate max-w-50">{action.error_message}</span>
+                      <div className="px-4 py-3 flex-1">
+                        {/* Primary: per-service 24h breakdown from /traffic */}
+                        {supabaseTraffic?.available && supabaseTraffic.breakdown.length > 0 ? (() => {
+                          const chartData = supabaseTraffic.breakdown.map((r) => ({
+                            service: r.service.charAt(0).toUpperCase() + r.service.slice(1),
+                            requests: r.total,
+                            errors: r.errors,
+                          }));
+                          return (
+                            <ResponsiveContainer width="100%" height={180}>
+                              <BarChart data={chartData} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
+                                <defs>
+                                  <linearGradient id="sbBarGrad" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor="#6f7bf7" stopOpacity={0.9} />
+                                    <stop offset="100%" stopColor="#6f7bf7" stopOpacity={0.4} />
+                                  </linearGradient>
+                                </defs>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
+                                <XAxis dataKey="service" tick={{ fontSize: 9, fill: "#9ca3af" }} axisLine={false} tickLine={false} />
+                                <YAxis tick={{ fontSize: 9, fill: "#9ca3af" }} axisLine={false} tickLine={false} tickFormatter={(v: number) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : String(v)} />
+                                <Tooltip
+                                  contentStyle={{ fontSize: 11, borderRadius: 8, border: "1px solid #e5e7eb", padding: "4px 10px" }}
+                                  formatter={(v, name) => [Number(v).toLocaleString(), name === "errors" ? "Errors" : "Requests"]}
+                                />
+                                <Bar dataKey="requests" stackId="a" fill="url(#sbBarGrad)" radius={[0, 0, 0, 0]} barSize={48} />
+                                <Bar dataKey="errors" stackId="a" fill="#f87171" radius={[3, 3, 0, 0]} barSize={48} />
+                              </BarChart>
+                            </ResponsiveContainer>
+                          );
+                        })()
+                        /* Fallback: daily totals from overview if traffic isn't available */
+                        : !supabaseTraffic ? (
+                          <div className="h-32 bg-gray-50 rounded-lg animate-pulse" />
+                        ) : supabaseOverview?.api_stats && supabaseOverview.api_stats.length > 0 ? (() => {
+                          const chartData = supabaseOverview.api_stats.slice(-7).map((p) => ({
+                            day: new Date(p.timestamp).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+                            requests: p.count,
+                          }));
+                          return (
+                            <ResponsiveContainer width="100%" height={160}>
+                              <BarChart data={chartData} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
+                                <defs>
+                                  <linearGradient id="sbBarGrad2" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor="#6f7bf7" stopOpacity={0.9} />
+                                    <stop offset="100%" stopColor="#6f7bf7" stopOpacity={0.4} />
+                                  </linearGradient>
+                                </defs>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
+                                <XAxis dataKey="day" tick={{ fontSize: 9, fill: "#9ca3af" }} axisLine={false} tickLine={false} />
+                                <YAxis tick={{ fontSize: 9, fill: "#9ca3af" }} axisLine={false} tickLine={false} tickFormatter={(v: number) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : String(v)} />
+                                <Tooltip
+                                  contentStyle={{ fontSize: 11, borderRadius: 8, border: "1px solid #e5e7eb", padding: "4px 10px" }}
+                                  formatter={(v) => [Number(v).toLocaleString(), "Requests"]}
+                                />
+                                <Bar dataKey="requests" fill="url(#sbBarGrad2)" radius={[3, 3, 0, 0]} />
+                              </BarChart>
+                            </ResponsiveContainer>
+                          );
+                        })() : (
+                          <p className="text-[12px] text-gray-400 py-4 text-center">No traffic data yet</p>
                         )}
                       </div>
-                      <span suppressHydrationWarning className="text-[11px] text-gray-400 shrink-0">{timeAgo(new Date(action.created_at).getTime())}</span>
                     </div>
-                  ))
-                )}
-              </div>
-            )}
+
+                    {/* Error Logs */}
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
+                      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
+                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Error Logs</p>
+                      </div>
+                      <SupabaseLogsPanel projectRef={supabaseSvc?.resource_id ?? ""} />
+                    </div>
+                  </div>
+
+                  {/* Row 3: Edge Functions + Storage side by side */}
+                  <div className="grid grid-cols-2 gap-3">
+                    {/* Edge Functions */}
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
+                      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
+                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Edge Functions</p>
+                        {supabaseFunctions.length > 0 && (
+                          <span className="text-[10px] text-gray-400">{supabaseFunctions.length} deployed</span>
+                        )}
+                      </div>
+                      {supabaseFunctions.length === 0 ? (
+                        <div className="flex flex-col items-center py-8 gap-1.5">
+                          <svg className="w-6 h-6 text-gray-200" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                          <p className="text-[12px] text-gray-400">No functions deployed</p>
+                        </div>
+                      ) : (
+                        <div className="divide-y divide-gray-100">
+                          {supabaseFunctions.map((fn) => (
+                            <div key={fn.id} className="flex items-center gap-3 px-4 py-2.5">
+                              <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${fn.status === "ACTIVE" ? "bg-emerald-400" : fn.status === "INACTIVE" ? "bg-gray-300" : "bg-amber-400"}`} />
+                              <div className="flex-1 min-w-0">
+                                <div className="text-[12px] font-medium text-gray-800 truncate">{fn.name}</div>
+                                <div className="text-[10px] text-gray-400 font-mono truncate">{fn.slug}</div>
+                              </div>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                {!fn.verify_jwt && (
+                                  <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-600" title="JWT verification disabled">No JWT</span>
+                                )}
+                                <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full ${fn.status === "ACTIVE" ? "bg-emerald-50 text-emerald-600" : "bg-gray-100 text-gray-500"}`}>{fn.status}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Storage Buckets */}
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
+                      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
+                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Storage</p>
+                        {supabaseStorage?.available && supabaseStorage.buckets.length > 0 && (
+                          <span className="text-[10px] text-gray-400">{supabaseStorage.buckets.length} bucket{supabaseStorage.buckets.length !== 1 ? "s" : ""}</span>
+                        )}
+                      </div>
+                      {!supabaseStorage ? (
+                        <div className="space-y-2 px-4 py-3 animate-pulse">{[0,1,2].map(i => <div key={i} className="h-10 bg-gray-50 rounded-lg" />)}</div>
+                      ) : !supabaseStorage.available ? (
+                        <div className="flex flex-col items-center py-8 gap-1.5">
+                          <p className="text-[12px] text-gray-400">Storage unavailable</p>
+                        </div>
+                      ) : supabaseStorage.buckets.length === 0 ? (
+                        <div className="flex flex-col items-center py-8 gap-1.5">
+                          <svg className="w-6 h-6 text-gray-200" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M5 8a7 7 0 0114 0v8a2 2 0 01-2 2H7a2 2 0 01-2-2V8z"/></svg>
+                          <p className="text-[12px] text-gray-400">No storage buckets</p>
+                        </div>
+                      ) : (
+                        <div className="divide-y divide-gray-100">
+                          {supabaseStorage.buckets.map((b) => (
+                            <div key={b.id} className="flex items-center gap-3 px-4 py-2.5">
+                              <svg className="w-4 h-4 text-gray-300 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M20 7H4a2 2 0 00-2 2v6a2 2 0 002 2h16a2 2 0 002-2V9a2 2 0 00-2-2z"/><path d="M16 3H8L4 7h16l-4-4z"/></svg>
+                              <div className="flex-1 min-w-0">
+                                <div className="text-[12px] font-medium text-gray-800 truncate">{b.name}</div>
+                                {b.file_size_limit && (
+                                  <div className="text-[10px] text-gray-400">limit {b.file_size_limit >= 1e6 ? `${(b.file_size_limit/1e6).toFixed(0)} MB` : `${b.file_size_limit} B`}</div>
+                                )}
+                              </div>
+                              <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${b.public ? "bg-amber-50 text-amber-600" : "bg-gray-100 text-gray-500"}`}>
+                                {b.public ? "Public" : "Private"}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Row 4: Actions full width */}
+                  <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
+                    <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
+                      <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Actions</p>
+                      {supabaseOverview && supabaseOverview.actions.length > 0 && (
+                        <span className="text-[10px] text-gray-400">{supabaseOverview.actions.length} total</span>
+                      )}
+                    </div>
+                    {!supabaseOverview ? (
+                      <p className="text-[12px] text-gray-400 text-center py-8">Loading…</p>
+                    ) : supabaseOverview.available.actions === false ? (
+                      <p className="text-[12px] text-gray-400 text-center py-8">Action history not available</p>
+                    ) : supabaseOverview.actions.length === 0 ? (
+                      <p className="text-[12px] text-gray-400 text-center py-8">No actions found</p>
+                    ) : (
+                      <div className="divide-y divide-gray-100">
+                        {supabaseOverview.actions.map((action) => (
+                          <div key={action.id} className="flex items-center gap-3 px-5 py-3">
+                            <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                              action.status === "COMPLETED" ? "bg-emerald-400" :
+                              action.status === "FAILED" ? "bg-red-400" :
+                              action.status === "IN_PROGRESS" ? "bg-amber-400 animate-pulse" :
+                              "bg-gray-300"
+                            }`} />
+                            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${
+                              action.status === "COMPLETED" ? "text-emerald-600 bg-emerald-50" :
+                              action.status === "FAILED" ? "text-red-500 bg-red-50" :
+                              action.status === "IN_PROGRESS" ? "text-amber-500 bg-amber-50" :
+                              "text-gray-500 bg-gray-100"
+                            }`}>{action.status}</span>
+                            {action.error_message && (
+                              <span className="text-[12px] text-gray-500 truncate flex-1">{action.error_message}</span>
+                            )}
+                            <span suppressHydrationWarning className="text-[11px] text-gray-400 shrink-0 ml-auto">{timeAgo(new Date(action.created_at).getTime())}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
           </>
         </div>
       )}

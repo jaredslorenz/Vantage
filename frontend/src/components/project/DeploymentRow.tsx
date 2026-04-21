@@ -13,10 +13,10 @@ function scoreColor(score: number | null) {
   return "text-red-600 bg-red-50";
 }
 
-export function DeploymentRow({ deployment, index, maxBuildDuration, onRedeploy, onViewLogs, githubRepo, initialAnalysis }: {
+export function DeploymentRow({ deployment, index, maxBuildDuration, onRedeploy, onViewLogs, githubRepo, initialAnalysis, projectId }: {
   deployment: Deployment; index: number; maxBuildDuration: number;
   onRedeploy: (id: string) => void; onViewLogs?: (id: string, name: string) => void;
-  githubRepo?: string; initialAnalysis?: DeployAnalysis;
+  githubRepo?: string; initialAnalysis?: DeployAnalysis; projectId?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [analysis, setAnalysis] = useState<DeployAnalysis | null>(initialAnalysis ?? null);
@@ -24,8 +24,8 @@ export function DeploymentRow({ deployment, index, maxBuildDuration, onRedeploy,
   const [lighthouse, setLighthouse] = useState<LighthouseScores | null>(null);
 
   useEffect(() => {
-    if (!expanded || lighthouse !== null) return;
-    apiFetch(`/api/vercel/deployments/${deployment.id}/checks`)
+    if (!expanded || lighthouse !== null || !projectId) return;
+    apiFetch(`/api/vercel/deployments/${deployment.id}/checks?projectId=${projectId}`)
       .then((r) => r.json())
       .then((d) => { if (d.lighthouse) setLighthouse(d.lighthouse); })
       .catch(() => {});

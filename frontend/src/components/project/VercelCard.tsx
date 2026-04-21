@@ -1,6 +1,6 @@
 "use client";
 
-import { timeAgo } from "@/lib/utils";
+
 import type { Deployment, ProjectService, UptimeStatus } from "@/types/project";
 import { StatusDot, STATE_COLOR, STATE_LABEL } from "@/components/project/StatusDot";
 
@@ -62,7 +62,7 @@ export function VercelCard({ service, deployments, selected, onClick, onUnlink, 
         {[
           { label: "Deploys", value: String(deployments.length) },
           { label: "Success", value: successRate !== null ? `${successRate}%` : "—" },
-          { label: "Last", value: latest ? timeAgo(latest.created_at) : "—" },
+          { label: "Avg Build", value: (() => { const ds = deployments.filter(d => d.build_duration); if (!ds.length) return "—"; const avg = ds.reduce((s, d) => s + d.build_duration!, 0) / ds.length; return avg >= 60 ? `${(avg / 60).toFixed(1)}m` : `${Math.round(avg)}s`; })() },
         ].map((s) => (
           <div key={s.label} className="bg-gray-50 rounded-lg px-2.5 py-2 text-center">
             <div className="text-[15px] font-bold text-gray-900">{s.value}</div>

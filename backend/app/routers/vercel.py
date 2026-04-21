@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone, timedelta
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from app.core.logger import logger
 from app.core.encryption import encrypt_token, decrypt_token
@@ -65,6 +66,22 @@ def _get_vercel_token(user_id: str) -> str:
     token_cache.set(user_id, "vercel", token)
     return token
 
+def _assert_owns_vercel_project(user_id: str, project_id: str) -> None:
+    """Raise 403 if project_id is not linked to a project owned by this user."""
+    projects = supabase.table("projects").select("id").eq("user_id", user_id).execute()
+    project_ids = [p["id"] for p in (projects.data or [])]
+    if not project_ids:
+        raise HTTPException(status_code=403, detail="Access denied")
+    result = supabase.table("project_services") \
+        .select("id") \
+        .eq("resource_id", project_id) \
+        .eq("service_type", "vercel") \
+        .in_("project_id", project_ids) \
+        .execute()
+    if not result.data:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
 router = APIRouter(prefix="/api/vercel", tags=["vercel"])
 
 
@@ -117,11 +134,13 @@ async def disconnect_vercel(user_id: str = Depends(get_user_id)):
 
 class RedeployRequest(BaseModel):
     deploymentId: str
+    projectId: str
 
 
 @router.post("/redeploy")
 async def redeploy(body: RedeployRequest, user_id: str = Depends(get_user_id)):
     """Redeploy an existing Vercel deployment."""
+    _assert_owns_vercel_project(user_id, body.projectId)
     token = _get_vercel_token(user_id)
 
     async with httpx.AsyncClient() as client:
@@ -192,9 +211,10 @@ async def get_vercel_projects(user_id: str = Depends(get_user_id)):
 async def get_deployment_logs(
     deployment_id: str,
     user_id: str = Depends(get_user_id),
-    projectId: str = Query(None),
+    projectId: str = Query(...),
 ):
     """Fetch structured build log lines for a Vercel deployment."""
+    _assert_owns_vercel_project(user_id, projectId)
     token = _get_vercel_token(user_id)
 
     lines = []
@@ -250,6 +270,22 @@ async def get_deployment_logs(
                     if text and event.get("type") in ("stderr", "command", "stdout"):
                         lines.append({"type": event.get("type"), "text": text})
 
+    # Fallback: pull stored error lines from events table (logs expire after ~7 days on Vercel)
+    if not lines:
+        try:
+            result = supabase.table("events") \
+                .select("metadata") \
+                .eq("user_id", user_id) \
+                .eq("external_id", deployment_id) \
+                .eq("service_type", "vercel") \
+                .limit(1) \
+                .execute()
+            if result.data:
+                stored = (result.data[0].get("metadata") or {}).get("error_lines", [])
+                lines = [{"type": "stderr", "text": t} for t in stored]
+        except Exception:
+            pass
+
     if not lines:
         raise HTTPException(status_code=404, detail="No logs available for this deployment")
 
@@ -259,6 +295,7 @@ async def get_deployment_logs(
 @router.get("/projects/{project_id}/env")
 async def get_env_vars(project_id: str, user_id: str = Depends(get_user_id)):
     """Fetch environment variable names (values redacted) for a Vercel project."""
+    _assert_owns_vercel_project(user_id, project_id)
     token = _get_vercel_token(user_id)
 
     async with httpx.AsyncClient() as client:
@@ -291,6 +328,8 @@ async def get_vercel_deployments(
     projectId: str = Query(None),
 ):
     """Fetch the user's recent Vercel deployments across personal and team scopes."""
+    if projectId:
+        _assert_owns_vercel_project(user_id, projectId)
     token = _get_vercel_token(user_id)
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -356,8 +395,13 @@ async def get_vercel_deployments(
 
 
 @router.get("/deployments/{deployment_id}/checks")
-async def get_deployment_checks(deployment_id: str, user_id: str = Depends(get_user_id)):
+async def get_deployment_checks(
+    deployment_id: str,
+    user_id: str = Depends(get_user_id),
+    projectId: str = Query(...),
+):
     """Fetch deployment checks (e.g. Lighthouse scores) for a Vercel deployment."""
+    _assert_owns_vercel_project(user_id, projectId)
     token = _get_vercel_token(user_id)
 
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -391,66 +435,3 @@ async def get_deployment_checks(deployment_id: str, user_id: str = Depends(get_u
     return {"checks": checks, "lighthouse": lighthouse}
 
 
-@router.get("/logs/{deployment_id}/runtime")
-async def get_runtime_logs(
-    deployment_id: str,
-    user_id: str = Depends(get_user_id),
-    projectId: str = Query(None),
-    window: int = Query(300, description="Only return logs from the last N seconds. Pass 0 for all logs."),
-):
-    """Fetch runtime logs for a Vercel deployment, optionally filtered to a recent time window."""
-    token = _get_vercel_token(user_id)
-
-    cutoff_ms = (datetime.now(timezone.utc).timestamp() - window) * 1000 if window > 0 else 0
-
-    url = (
-        f"{VERCEL_API}/v1/projects/{projectId}/deployments/{deployment_id}/runtime-logs"
-        if projectId
-        else f"{VERCEL_API}/v1/deployments/{deployment_id}/runtime-logs"
-    )
-
-    lines = []
-    async with httpx.AsyncClient() as client:
-        try:
-            async with client.stream(
-                "GET", url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=httpx.Timeout(connect=10.0, read=10.0, write=5.0, pool=5.0),
-            ) as stream:
-                if stream.status_code == 200:
-                    async for raw_line in stream.aiter_lines():
-                        raw_line = raw_line.strip()
-                        if not raw_line:
-                            continue
-                        try:
-                            entry = json.loads(raw_line)
-                            ts = entry.get("timestampInMs", 0)
-                            if cutoff_ms and ts and ts < cutoff_ms:
-                                continue
-                            text = _strip_ansi(entry.get("message") or entry.get("text") or "").strip()
-                            if not text:
-                                continue
-                            level = entry.get("level", "info")
-                            lines.append({
-                                "type": "stderr" if level == "error" else "stdout",
-                                "text": text,
-                                "timestamp": ts,
-                                "level": level,
-                                "request_path": entry.get("requestPath"),
-                                "status_code": entry.get("responseStatusCode"),
-                            })
-                        except json.JSONDecodeError:
-                            lines.append({"type": "stdout", "text": _strip_ansi(raw_line), "timestamp": 0})
-                elif stream.status_code == 404:
-                    raise HTTPException(status_code=404, detail="Deployment not found or no runtime logs available")
-                else:
-                    raise HTTPException(status_code=502, detail=f"Vercel returned {stream.status_code}")
-        except (httpx.ReadTimeout, asyncio.TimeoutError):
-            pass  # Return what we collected before timeout
-        except HTTPException:
-            raise
-        except Exception as exc:
-            if not lines:
-                raise HTTPException(status_code=502, detail=f"Failed to fetch runtime logs: {exc}")
-
-    return {"lines": lines, "deployment_id": deployment_id}

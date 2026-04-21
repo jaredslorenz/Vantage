@@ -41,7 +41,47 @@ def _cache_set(key: str, value: object) -> None:
     _cache[key] = (datetime.now(timezone.utc).timestamp(), value)
 
 
+def _cache_evict() -> None:
+    now = datetime.now(timezone.utc).timestamp()
+    stale = [k for k, (ts, _) in _cache.items() if now - ts >= _CACHE_TTL]
+    for k in stale:
+        del _cache[k]
+    if stale:
+        logger.debug("Cache evicted %d stale entries (%d remaining)", len(stale), len(_cache))
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+def _mark_service_unhealthy(user_id: str, service_type: str) -> None:
+    try:
+        supabase.table("connected_services") \
+            .update({"health_status": "unhealthy"}) \
+            .eq("user_id", user_id) \
+            .eq("service_type", service_type) \
+            .execute()
+    except Exception as exc:
+        logger.error("Failed to mark %s unhealthy user=%s: %s", service_type, user_id, exc)
+
+
+_RENDER_TYPE_SLUG = {
+    "web_service": "web", "static_site": "static",
+    "cron_job": "cron", "background_worker": "worker", "private_service": "pserv",
+}
+
+
+def _render_url(svc_id: str, svc_type: str = "web_service", path: str = "") -> str:
+    slug = _RENDER_TYPE_SLUG.get(svc_type, "web")
+    base = f"https://dashboard.render.com/{slug}/{svc_id}"
+    return f"{base}/{path}" if path else base
+
+
+def _log_rate_limited(service: str, user_id: str, resp) -> bool:
+    if resp.status_code == 429:
+        retry_after = resp.headers.get("Retry-After", "unknown")
+        logger.warning("Rate limited by %s user=%s retry-after=%s", service, user_id, retry_after)
+        return True
+    return False
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -184,9 +224,14 @@ async def poll_vercel() -> None:
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0)) as client:
         for user in users:
+            user_id = user["user_id"]
             try:
                 token = decrypt_token(user["api_token"])
-                user_id = user["user_id"]
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=vercel: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "vercel")
+                continue
+            try:
                 project_map = _get_project_map(user_id, "vercel")
                 headers = {"Authorization": f"Bearer {token}"}
 
@@ -207,6 +252,8 @@ async def poll_vercel() -> None:
                     if team_id:
                         params["teamId"] = team_id
                     resp = await client.get(f"{VERCEL_API}/v6/deployments", headers=headers, params=params)
+                    if _log_rate_limited("Vercel", user_id, resp):
+                        break
                     if resp.status_code != 200:
                         continue
                     for d in resp.json().get("deployments", []):
@@ -263,7 +310,7 @@ async def poll_vercel() -> None:
                 _upsert_events(rows)
 
             except Exception as exc:
-                logger.error("Vercel poll failed user=%s: %s", user["user_id"], exc)
+                logger.error("Vercel poll failed user=%s: %s", user_id, exc)
 
 
 # ── Render ─────────────────────────────────────────────────────────────────
@@ -275,23 +322,34 @@ async def poll_render() -> None:
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0)) as client:
         for user in users:
+            user_id = user["user_id"]
             try:
                 token = decrypt_token(user["api_token"])
-                user_id = user["user_id"]
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=render: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "render")
+                continue
+            try:
                 project_map = _get_project_map(user_id, "render")
                 headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
                 svcs_resp = await client.get(f"{RENDER_API}/services", headers=headers, params={"limit": 20})
+                if _log_rate_limited("Render", user_id, svcs_resp):
+                    continue
                 if svcs_resp.status_code != 200:
                     continue
 
                 services = [
-                    (item.get("service", item).get("id"), item.get("service", item).get("name", "Service"))
+                    (
+                        item.get("service", item).get("id"),
+                        item.get("service", item).get("name", "Service"),
+                        item.get("service", item).get("type", "web_service"),
+                    )
                     for item in svcs_resp.json()
                     if item.get("service", item).get("id")
                 ]
 
-                async def _fetch_renders(svc_id: str, svc_name: str) -> list[dict]:
+                async def _fetch_renders(svc_id: str, svc_name: str, svc_type: str) -> list[dict]:
                     resp = await client.get(
                         f"{RENDER_API}/services/{svc_id}/deploys",
                         headers=headers,
@@ -302,6 +360,7 @@ async def poll_render() -> None:
                     result = []
                     for item in resp.json():
                         d = item.get("deploy", item)
+                        deploy_id = d.get("id", "")
                         commit = d.get("commit") or {}
                         raw_status = d.get("status", "")
                         status = (
@@ -314,7 +373,7 @@ async def poll_render() -> None:
                         build_error_lines: list[str] = []
                         if raw_status == "build_failed":
                             try:
-                                build_error_lines = await _fetch_render_build_errors(svc_id, d.get("id", ""), headers, client)
+                                build_error_lines = await _fetch_render_build_errors(svc_id, deploy_id, headers, client)
                                 if build_error_lines:
                                     subtitle = build_error_lines[0]
                             except Exception:
@@ -327,8 +386,8 @@ async def poll_render() -> None:
                             "title": svc_name,
                             "subtitle": subtitle,
                             "status": status,
-                            "external_url": "https://dashboard.render.com",
-                            "external_id": d.get("id", ""),
+                            "external_url": _render_url(svc_id, svc_type, f"deploys/{deploy_id}"),
+                            "external_id": deploy_id,
                             "metadata": {
                                 "raw_status": raw_status,
                                 "commit_message": msg,
@@ -339,7 +398,7 @@ async def poll_render() -> None:
                     return result
 
                 batches = await asyncio.gather(
-                    *[_fetch_renders(sid, sname) for sid, sname in services],
+                    *[_fetch_renders(sid, sname, stype) for sid, sname, stype in services],
                     return_exceptions=True,
                 )
                 rows = []
@@ -349,7 +408,7 @@ async def poll_render() -> None:
                 _upsert_events(rows)
 
             except Exception as exc:
-                logger.error("Render poll failed user=%s: %s", user["user_id"], exc)
+                logger.error("Render poll failed user=%s: %s", user_id, exc)
 
 
 # ── GitHub ─────────────────────────────────────────────────────────────────
@@ -361,9 +420,14 @@ async def poll_github() -> None:
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=20.0, write=8.0, pool=8.0)) as client:
         for user in users:
+            user_id = user["user_id"]
             try:
                 token = decrypt_token(user["api_token"])
-                user_id = user["user_id"]
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=github: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "github")
+                continue
+            try:
                 project_map = _get_project_map(user_id, "github")
                 headers = {
                     "Authorization": f"Bearer {token}",
@@ -453,7 +517,7 @@ async def poll_github() -> None:
                 _upsert_events(rows)
 
             except Exception as exc:
-                logger.error("GitHub poll failed user=%s: %s", user["user_id"], exc)
+                logger.error("GitHub poll failed user=%s: %s", user_id, exc)
 
 
 # ── Vercel log scanning ────────────────────────────────────────────────────
@@ -469,9 +533,14 @@ async def scan_vercel_logs() -> None:
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0)) as client:
         for user in users:
+            user_id = user["user_id"]
             try:
                 token = decrypt_token(user["api_token"])
-                user_id = user["user_id"]
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=vercel: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "vercel")
+                continue
+            try:
                 project_map = _get_project_map(user_id, "vercel")
                 headers = {"Authorization": f"Bearer {token}"}
 
@@ -489,6 +558,8 @@ async def scan_vercel_logs() -> None:
                     if team_id:
                         params["teamId"] = team_id
                     resp = await client.get(f"{VERCEL_API}/v6/deployments", headers=headers, params=params)
+                    if _log_rate_limited("Vercel", user_id, resp):
+                        break
                     if resp.status_code != 200:
                         continue
                     for d in resp.json().get("deployments", []):
@@ -543,7 +614,7 @@ async def scan_vercel_logs() -> None:
                                 "title": f"Runtime error in {dep_name}",
                                 "subtitle": first[:120],
                                 "status": "error",
-                                "external_url": f"https://vercel.com/{dep_name}",
+                                "external_url": f"https://vercel.com/deployments/{dep_id}",
                                 "external_id": error_id,
                                 "metadata": {"errors": error_lines[:10], "deployment_id": dep_id, "service_name": dep_name},
                                 "occurred_at": _now_iso(),
@@ -557,10 +628,29 @@ async def scan_vercel_logs() -> None:
                 _upsert_events(rows)
 
             except Exception as exc:
-                logger.error("Vercel log scan failed user=%s: %s", user["user_id"], exc)
+                logger.error("Vercel log scan failed user=%s: %s", user_id, exc)
 
 
-# ── Render metrics alerting ────────────────────────────────────────────────
+# Free-tier fallbacks — used when the limit endpoint returns nothing
+_CPU_LIMIT_FALLBACK = 0.1    # 100 mCPU
+_MEM_LIMIT_FALLBACK = 512 * 1024 * 1024  # 512 MB
+
+
+def _parse_metric_series(resp) -> list[float]:
+    """Extract values from a Render metrics response (time-series or scalar)."""
+    if isinstance(resp, Exception) or resp.status_code != 200:
+        return []
+    data = resp.json()
+    # Time-series format: [{values: [{timestamp, value}, ...]}]
+    if isinstance(data, list) and data and isinstance(data[0], dict) and "values" in data[0]:
+        return [v["value"] for v in data[0]["values"] if v.get("value") is not None]
+    # Scalar format: {"value": 0.5} or [{"value": 0.5}]
+    if isinstance(data, dict) and "value" in data:
+        return [data["value"]]
+    if isinstance(data, list) and data and isinstance(data[0], dict) and "value" in data[0]:
+        return [data[0]["value"]]
+    return []
+
 
 async def poll_render_metrics() -> None:
     """Check CPU/memory metrics for all Render services and alert on sustained anomalies."""
@@ -574,13 +664,20 @@ async def poll_render_metrics() -> None:
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0)) as client:
         for user in users:
+            user_id = user["user_id"]
             try:
                 token = decrypt_token(user["api_token"])
-                user_id = user["user_id"]
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=render: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "render")
+                continue
+            try:
                 project_map = _get_project_map(user_id, "render")
                 headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
                 svcs_resp = await client.get(f"{RENDER_API}/services", headers=headers, params={"limit": 20})
+                if _log_rate_limited("Render", user_id, svcs_resp):
+                    continue
                 if svcs_resp.status_code != 200:
                     continue
 
@@ -589,71 +686,84 @@ async def poll_render_metrics() -> None:
                     svc = item.get("service", item)
                     svc_id = svc.get("id", "")
                     svc_name = svc.get("name", "")
+                    svc_type = svc.get("type", "web_service")
                     if not svc_id:
                         continue
 
-                    params: dict = {"resource": svc_id, "startTime": start_time, "endTime": end_time, "resolutionSeconds": 60}
+                    # Limit endpoints accept the same params as usage — they return constant
+                    # plan-allocation values repeated across the time range.
+                    shared_params: dict = {"resource": svc_id, "startTime": start_time, "endTime": end_time, "resolutionSeconds": 60}
 
                     cpu_resp, mem_resp, cpu_lim_resp, mem_lim_resp = await asyncio.gather(
-                        client.get(f"{RENDER_API}/metrics/cpu", headers=headers, params=params),
-                        client.get(f"{RENDER_API}/metrics/memory", headers=headers, params=params),
-                        client.get(f"{RENDER_API}/metrics/cpu-limit", headers=headers, params=params),
-                        client.get(f"{RENDER_API}/metrics/memory-limit", headers=headers, params=params),
+                        client.get(f"{RENDER_API}/metrics/cpu", headers=headers, params=shared_params),
+                        client.get(f"{RENDER_API}/metrics/memory", headers=headers, params=shared_params),
+                        client.get(f"{RENDER_API}/metrics/cpu-limit", headers=headers, params=shared_params),
+                        client.get(f"{RENDER_API}/metrics/memory-limit", headers=headers, params=shared_params),
                         return_exceptions=True,
                     )
 
-                    def _avg(resp) -> float | None:
-                        if isinstance(resp, Exception) or resp.status_code != 200:
-                            return None
-                        data = resp.json()
-                        if not isinstance(data, list) or not data:
-                            return None
-                        vals = [v.get("value", 0) for v in data[0].get("values", []) if v.get("value") is not None]
-                        return sum(vals) / len(vals) if vals else None
+                    # Average of the last 3 samples to confirm sustained usage (not a spike)
+                    cpu_vals = _parse_metric_series(cpu_resp)
+                    mem_vals = _parse_metric_series(mem_resp)
+                    cpu_lim_vals = _parse_metric_series(cpu_lim_resp)
+                    mem_lim_vals = _parse_metric_series(mem_lim_resp)
 
-                    cpu_avg = _avg(cpu_resp)
-                    mem_avg = _avg(mem_resp)
-                    cpu_limit = _avg(cpu_lim_resp)
-                    mem_limit = _avg(mem_lim_resp)
+                    cpu_avg = sum(cpu_vals[-3:]) / len(cpu_vals[-3:]) if cpu_vals else None
+                    mem_avg = sum(mem_vals[-3:]) / len(mem_vals[-3:]) if mem_vals else None
+                    cpu_limit = cpu_lim_vals[0] if cpu_lim_vals else _CPU_LIMIT_FALLBACK
+                    mem_limit = mem_lim_vals[0] if mem_lim_vals else _MEM_LIMIT_FALLBACK
 
-                    if cpu_avg is not None and cpu_limit and cpu_limit > 0:
+                    if cpu_avg is not None:
                         pct = cpu_avg / cpu_limit
                         if pct > 0.85:
                             rows.append({
                                 "user_id": user_id,
                                 "project_id": project_map.get(svc_id),
                                 "service_type": "render",
-                                "event_type": "metric_alert",
+                                "event_type": "runtime_error",
                                 "title": f"High CPU on {svc_name}",
-                                "subtitle": f"{round(pct * 100)}% CPU usage sustained over 10 min",
+                                "subtitle": f"{round(pct * 100)}% of CPU limit sustained over 10 min",
                                 "status": "error",
-                                "external_url": "https://dashboard.render.com",
+                                "external_url": _render_url(svc_id, svc_type, "metrics"),
                                 "external_id": f"metric-cpu-{svc_id}",
-                                "metadata": {"cpu_pct": round(pct * 100), "service_id": svc_id},
+                                "metadata": {
+                                    "alert_type": "cpu",
+                                    "cpu_pct": round(pct * 100),
+                                    "cpu_mcpu": round(cpu_avg * 1000),
+                                    "service_name": svc_name,
+                                },
                                 "occurred_at": end_time,
                             })
 
-                    if mem_avg is not None and mem_limit and mem_limit > 0:
+                    if mem_avg is not None:
                         pct = mem_avg / mem_limit
-                        if pct > 0.90:
+                        if pct > 0.85:
+                            mem_mb = round(mem_avg / 1024 / 1024)
+                            limit_mb = round(mem_limit / 1024 / 1024)
                             rows.append({
                                 "user_id": user_id,
                                 "project_id": project_map.get(svc_id),
                                 "service_type": "render",
-                                "event_type": "metric_alert",
+                                "event_type": "runtime_error",
                                 "title": f"High memory on {svc_name}",
-                                "subtitle": f"{round(pct * 100)}% memory usage sustained over 10 min",
+                                "subtitle": f"{mem_mb} MB / {limit_mb} MB ({round(pct * 100)}%) — approaching limit",
                                 "status": "error",
-                                "external_url": "https://dashboard.render.com",
+                                "external_url": _render_url(svc_id, svc_type, "metrics"),
                                 "external_id": f"metric-mem-{svc_id}",
-                                "metadata": {"mem_pct": round(pct * 100), "service_id": svc_id},
+                                "metadata": {
+                                    "alert_type": "memory",
+                                    "mem_pct": round(pct * 100),
+                                    "mem_mb": mem_mb,
+                                    "limit_mb": limit_mb,
+                                    "service_name": svc_name,
+                                },
                                 "occurred_at": end_time,
                             })
 
                 _upsert_events(rows)
 
             except Exception as exc:
-                logger.error("Render metrics poll failed user=%s: %s", user["user_id"], exc)
+                logger.error("Render metrics poll failed user=%s: %s", user_id, exc)
 
 
 # ── Render log scanning ────────────────────────────────────────────────────
@@ -687,13 +797,20 @@ async def scan_render_logs() -> None:
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0)) as client:
         for user in users:
+            user_id = user["user_id"]
             try:
                 token = decrypt_token(user["api_token"])
-                user_id = user["user_id"]
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=render: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "render")
+                continue
+            try:
                 project_map = _get_project_map(user_id, "render")
                 headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
                 svcs_resp = await client.get(f"{RENDER_API}/services", headers=headers, params={"limit": 20})
+                if _log_rate_limited("Render", user_id, svcs_resp):
+                    continue
                 if svcs_resp.status_code != 200:
                     continue
 
@@ -707,6 +824,7 @@ async def scan_render_logs() -> None:
                     svc = item.get("service", item)
                     svc_id = svc.get("id", "")
                     svc_name = svc.get("name", "")
+                    svc_type = svc.get("type", "web_service")
                     if not svc_id:
                         continue
                     params: dict = {"resource": svc_id, "limit": 100, "startTime": start_time, "endTime": end_time}
@@ -739,7 +857,7 @@ async def scan_render_logs() -> None:
                         "title": f"Runtime error in {svc_name}",
                         "subtitle": first[:120],
                         "status": "error",
-                        "external_url": "https://dashboard.render.com",
+                        "external_url": _render_url(svc_id, svc_type, "logs"),
                         "external_id": error_id,
                         "metadata": {"errors": error_lines[:10], "service_id": svc_id, "service_name": svc_name},
                         "occurred_at": end_time,
@@ -748,7 +866,7 @@ async def scan_render_logs() -> None:
                 _upsert_events(rows)
 
             except Exception as exc:
-                logger.error("Render log scan failed user=%s: %s", user["user_id"], exc)
+                logger.error("Render log scan failed user=%s: %s", user_id, exc)
 
 
 # ── Render service health ──────────────────────────────────────────────────
@@ -760,9 +878,14 @@ async def check_render_service_health() -> None:
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0)) as client:
         for user in users:
+            user_id = user["user_id"]
             try:
                 token = decrypt_token(user["api_token"])
-                user_id = user["user_id"]
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=render: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "render")
+                continue
+            try:
                 project_map = _get_project_map(user_id, "render")
                 headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
@@ -775,6 +898,7 @@ async def check_render_service_health() -> None:
                     svc = item.get("service", item)
                     svc_id = svc.get("id", "")
                     svc_name = svc.get("name", "")
+                    svc_type = svc.get("type", "web_service")
                     suspended = svc.get("suspended") == "suspended"
                     if not svc_id or not suspended:
                         continue
@@ -787,7 +911,7 @@ async def check_render_service_health() -> None:
                         "title": f"{svc_name} is suspended",
                         "subtitle": "Service has been suspended on Render",
                         "status": "error",
-                        "external_url": "https://dashboard.render.com",
+                        "external_url": _render_url(svc_id, svc_type),
                         "external_id": f"suspended-{svc_id}",
                         "metadata": {"service_id": svc_id, "service_name": svc_name},
                         "occurred_at": _now_iso(),
@@ -796,7 +920,7 @@ async def check_render_service_health() -> None:
                 _upsert_events(rows)
 
             except Exception as exc:
-                logger.error("Render health check failed user=%s: %s", user["user_id"], exc)
+                logger.error("Render health check failed user=%s: %s", user_id, exc)
 
 
 # ── Endpoint health checks ─────────────────────────────────────────────────
@@ -826,9 +950,14 @@ async def check_endpoints() -> None:
     # Collect Vercel deployment URLs
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0)) as client:
         for user in users_vercel:
+            user_id = user["user_id"]
             try:
                 token = decrypt_token(user["api_token"])
-                user_id = user["user_id"]
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=vercel: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "vercel")
+                continue
+            try:
                 project_map = _get_project_map(user_id, "vercel")
                 headers = {"Authorization": f"Bearer {token}"}
 
@@ -837,9 +966,11 @@ async def check_endpoints() -> None:
                     continue
                 for p in resp.json().get("projects", []):
                     deps = p.get("latestDeployments", [])
-                    if not deps or not deps[0].get("url"):
+                    # Only ping production deployments — previews can legitimately be slow or down
+                    prod_dep = next((d for d in deps if d.get("target") == "production"), None)
+                    if not prod_dep or not prod_dep.get("url"):
                         continue
-                    url = f"https://{deps[0]['url']}"
+                    url = f"https://{prod_dep['url']}"
                     if _is_safe_url(url):
                         targets.append({
                             "user_id": user_id,
@@ -850,12 +981,17 @@ async def check_endpoints() -> None:
                             "url": url,
                         })
             except Exception as exc:
-                logger.error("Endpoint collect vercel failed user=%s: %s", user["user_id"], exc)
+                logger.error("Endpoint collect vercel failed user=%s: %s", user_id, exc)
 
         for user in users_render:
+            user_id = user["user_id"]
             try:
                 token = decrypt_token(user["api_token"])
-                user_id = user["user_id"]
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=render: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "render")
+                continue
+            try:
                 project_map = _get_project_map(user_id, "render")
                 headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
@@ -876,7 +1012,7 @@ async def check_endpoints() -> None:
                         "url": url,
                     })
             except Exception as exc:
-                logger.error("Endpoint collect render failed user=%s: %s", user["user_id"], exc)
+                logger.error("Endpoint collect render failed user=%s: %s", user_id, exc)
 
         # Ping all targets
         uptime_rows = []
@@ -956,19 +1092,343 @@ def cleanup_events() -> None:
         logger.error("Events cleanup failed: %s", exc)
 
 
+# ── Vercel token health ────────────────────────────────────────────────────
+
+async def check_vercel_service_health() -> None:
+    """Validate all connected Vercel tokens and mark expired/revoked ones unhealthy."""
+    users = _get_connected_users("vercel")
+    if not users:
+        return
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0)) as client:
+        for user in users:
+            user_id = user["user_id"]
+            try:
+                token = decrypt_token(user["api_token"])
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=vercel: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "vercel")
+                continue
+            try:
+                resp = await client.get(
+                    f"{VERCEL_API}/v2/user",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if resp.status_code in (401, 403):
+                    logger.warning("Vercel token invalid/expired user=%s status=%d", user_id, resp.status_code)
+                    _mark_service_unhealthy(user_id, "vercel")
+                elif resp.status_code == 200:
+                    try:
+                        supabase.table("connected_services") \
+                            .update({"health_status": "healthy"}) \
+                            .eq("user_id", user_id) \
+                            .eq("service_type", "vercel") \
+                            .execute()
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.error("Vercel health check failed user=%s: %s", user_id, exc)
+
+
+# ── Supabase ───────────────────────────────────────────────────────────────
+
+SUPABASE_API = "https://api.supabase.com/v1"
+
+_SUPABASE_LOG_SQL = (
+    "select datetime(timestamp), event_message,"
+    " m.parsed.error_severity, m.parsed.sql_state_code, m.parsed.user_name"
+    " from postgres_logs"
+    " cross join unnest(metadata) as m"
+    " where m.parsed.error_severity in ('ERROR', 'FATAL')"
+    " and timestamp > timestamp_sub(current_timestamp(), interval 1 hour)"
+    " order by timestamp desc limit 50"
+)
+
+_METRIC_ALLOWLIST = {
+    "pg_stat_database_numbackends", "pg_settings_max_connections",
+    "pg_database_size_bytes", "node_filesystem_avail_bytes",
+    "node_filesystem_size_bytes", "node_memory_MemAvailable_bytes",
+    "node_memory_MemTotal_bytes", "supabase_active_connections",
+}
+_METRIC_SUM = {"pg_stat_database_numbackends", "supabase_active_connections"}
+
+
+def _parse_prometheus(text: str) -> dict[str, float]:
+    result: dict[str, list[float]] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.rsplit(" ", 1)
+        if len(parts) != 2:
+            continue
+        name = parts[0].split("{")[0]
+        if name not in _METRIC_ALLOWLIST:
+            continue
+        try:
+            result.setdefault(name, []).append(float(parts[1]))
+        except ValueError:
+            continue
+    return {k: (sum(v) if k in _METRIC_SUM else v[0]) for k, v in result.items()}
+
+
+async def poll_supabase() -> None:
+    """Poll Supabase project health and write service_health events."""
+    users = _get_connected_users("supabase")
+    if not users:
+        return
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0)) as client:
+        for user in users:
+            user_id = user["user_id"]
+            try:
+                token = decrypt_token(user["api_token"])
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=supabase: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "supabase")
+                continue
+            try:
+                project_map = _get_project_map(user_id, "supabase")
+                if not project_map:
+                    continue
+                headers = {"Authorization": f"Bearer {token}"}
+
+                rows = []
+                for ref, project_id in project_map.items():
+                    resp = await client.get(
+                        f"{SUPABASE_API}/projects/{ref}/health",
+                        headers=headers,
+                        params=[
+                            ("services", "auth"), ("services", "db"),
+                            ("services", "realtime"), ("services", "rest"),
+                            ("services", "storage"), ("services", "pooler"),
+                        ],
+                    )
+                    if _log_rate_limited("Supabase", user_id, resp):
+                        break
+                    if resp.status_code != 200:
+                        continue
+
+                    unhealthy = [s for s in resp.json() if s.get("status") != "ACTIVE_HEALTHY"]
+                    if not unhealthy:
+                        continue
+
+                    for svc in unhealthy:
+                        name = svc.get("name", "unknown")
+                        status = svc.get("status", "unknown")
+                        rows.append({
+                            "user_id": user_id,
+                            "project_id": project_id,
+                            "service_type": "supabase",
+                            "event_type": "service_health",
+                            "title": f"{name} is {status}",
+                            "subtitle": f"Supabase service degraded: {name}",
+                            "status": "error",
+                            "external_url": f"https://supabase.com/dashboard/project/{ref}",
+                            "external_id": f"health-{ref}-{name}",
+                            "metadata": {"service": name, "status": status, "ref": ref},
+                            "occurred_at": _now_iso(),
+                        })
+
+                _upsert_events(rows)
+
+            except Exception as exc:
+                logger.error("Supabase poll failed user=%s: %s", user_id, exc)
+
+
+async def scan_supabase_logs() -> None:
+    """Scan postgres_logs for ERROR/FATAL entries and write runtime_error events."""
+    users = _get_connected_users("supabase")
+    if not users:
+        return
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=20.0, write=8.0, pool=8.0)) as client:
+        for user in users:
+            user_id = user["user_id"]
+            try:
+                token = decrypt_token(user["api_token"])
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=supabase: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "supabase")
+                continue
+            try:
+                project_map = _get_project_map(user_id, "supabase")
+                if not project_map:
+                    continue
+                headers = {"Authorization": f"Bearer {token}"}
+
+                rows = []
+                for ref, project_id in project_map.items():
+                    resp = await client.get(
+                        f"{SUPABASE_API}/projects/{ref}/analytics/endpoints/logs.all",
+                        headers=headers,
+                        params={"sql": _SUPABASE_LOG_SQL},
+                    )
+                    if _log_rate_limited("Supabase", user_id, resp):
+                        break
+                    if resp.status_code != 200:
+                        continue
+
+                    raw = resp.json()
+                    log_rows = raw.get("result", raw.get("data", []))
+                    if not log_rows:
+                        continue
+
+                    errors = []
+                    for row in (log_rows if isinstance(log_rows, list) else []):
+                        msg = str(row.get("event_message", "")).strip()
+                        severity = row.get("error_severity", "ERROR")
+                        if msg:
+                            errors.append(f"[{severity}] {msg[:200]}")
+
+                    if not errors:
+                        continue
+
+                    first = errors[0]
+                    error_id = hashlib.md5(f"supabase:{ref}:{first[:100]}".encode()).hexdigest()
+                    rows.append({
+                        "user_id": user_id,
+                        "project_id": project_id,
+                        "service_type": "supabase",
+                        "event_type": "runtime_error",
+                        "title": f"Database error in {ref}",
+                        "subtitle": first[:120],
+                        "status": "error",
+                        "external_url": f"https://supabase.com/dashboard/project/{ref}/logs/postgres-logs",
+                        "external_id": error_id,
+                        "metadata": {"errors": errors[:10], "ref": ref},
+                        "occurred_at": _now_iso(),
+                    })
+
+                _upsert_events(rows)
+
+            except Exception as exc:
+                logger.error("Supabase log scan failed user=%s: %s", user_id, exc)
+
+
+async def check_supabase_metrics() -> None:
+    """Scrape Prometheus metrics and alert on connection saturation or disk pressure."""
+    users = _get_connected_users("supabase")
+    if not users:
+        return
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=20.0, write=8.0, pool=8.0)) as client:
+        for user in users:
+            user_id = user["user_id"]
+            try:
+                token = decrypt_token(user["api_token"])
+            except Exception as exc:
+                logger.warning("Token decryption failed user=%s service=supabase: %s", user_id, exc)
+                _mark_service_unhealthy(user_id, "supabase")
+                continue
+            try:
+                project_map = _get_project_map(user_id, "supabase")
+                if not project_map:
+                    continue
+                headers = {"Authorization": f"Bearer {token}"}
+
+                rows = []
+                for ref, project_id in project_map.items():
+                    # Exchange access token for service role key
+                    keys_resp = await client.get(
+                        f"{SUPABASE_API}/projects/{ref}/api-keys",
+                        headers=headers,
+                        params={"reveal": "true"},
+                    )
+                    if keys_resp.status_code != 200:
+                        continue
+                    svc_key = next(
+                        (k.get("api_key") or k.get("token", "") for k in keys_resp.json() if k.get("name") == "service_role"),
+                        None,
+                    )
+                    if not svc_key:
+                        continue
+
+                    metrics_resp = await client.get(
+                        f"https://{ref}.supabase.co/customer/v1/privileged/metrics",
+                        auth=("service_role", svc_key),
+                    )
+                    if metrics_resp.status_code != 200:
+                        continue
+
+                    m = _parse_prometheus(metrics_resp.text)
+                    connections = m.get("pg_stat_database_numbackends") or m.get("supabase_active_connections")
+                    max_conn = m.get("pg_settings_max_connections")
+                    fs_avail = m.get("node_filesystem_avail_bytes")
+                    fs_total = m.get("node_filesystem_size_bytes")
+
+                    if connections and max_conn and max_conn > 0:
+                        pct = connections / max_conn
+                        if pct > 0.80:
+                            rows.append({
+                                "user_id": user_id,
+                                "project_id": project_id,
+                                "service_type": "supabase",
+                                "event_type": "runtime_error",
+                                "title": f"High connection usage on {ref}",
+                                "subtitle": f"{int(connections)} / {int(max_conn)} connections ({round(pct * 100)}%)",
+                                "status": "error",
+                                "external_url": f"https://supabase.com/dashboard/project/{ref}/reports/database",
+                                "external_id": f"metric-conn-{ref}",
+                                "metadata": {
+                                    "alert_type": "connections",
+                                    "conn_pct": round(pct * 100),
+                                    "connections": int(connections),
+                                    "max_connections": int(max_conn),
+                                    "ref": ref,
+                                },
+                                "occurred_at": _now_iso(),
+                            })
+
+                    if fs_avail and fs_total and fs_total > 0:
+                        used_pct = (fs_total - fs_avail) / fs_total
+                        if used_pct > 0.80:
+                            used_gb = round((fs_total - fs_avail) / 1e9, 1)
+                            total_gb = round(fs_total / 1e9, 1)
+                            rows.append({
+                                "user_id": user_id,
+                                "project_id": project_id,
+                                "service_type": "supabase",
+                                "event_type": "runtime_error",
+                                "title": f"High disk usage on {ref}",
+                                "subtitle": f"{used_gb} GB / {total_gb} GB used ({round(used_pct * 100)}%)",
+                                "status": "error",
+                                "external_url": f"https://supabase.com/dashboard/project/{ref}/reports/database",
+                                "external_id": f"metric-disk-{ref}",
+                                "metadata": {
+                                    "alert_type": "disk",
+                                    "disk_pct": round(used_pct * 100),
+                                    "used_gb": used_gb,
+                                    "total_gb": total_gb,
+                                    "ref": ref,
+                                },
+                                "occurred_at": _now_iso(),
+                            })
+
+                _upsert_events(rows)
+
+            except Exception as exc:
+                logger.error("Supabase metrics check failed user=%s: %s", user_id, exc)
+
+
 # ── Scheduler setup ────────────────────────────────────────────────────────
 
 def start_scheduler() -> None:
-    scheduler.add_job(poll_vercel, "interval", minutes=2, id="poll_vercel", max_instances=1)
-    scheduler.add_job(poll_render, "interval", minutes=2, id="poll_render", max_instances=1)
-    scheduler.add_job(poll_github, "interval", minutes=5, id="poll_github", max_instances=1)
-    scheduler.add_job(poll_render_metrics, "interval", minutes=10, id="render_metrics", max_instances=1)
-    scheduler.add_job(scan_render_logs, "interval", minutes=2, id="scan_render_logs", max_instances=1)
-    scheduler.add_job(scan_vercel_logs, "interval", minutes=2, id="scan_vercel_logs", max_instances=1)
-    scheduler.add_job(check_render_service_health, "interval", minutes=10, id="render_health", max_instances=1)
-    scheduler.add_job(check_endpoints, "interval", minutes=10, id="check_endpoints", max_instances=1)
+    scheduler.add_job(poll_vercel, "interval", minutes=2, id="poll_vercel", max_instances=1, jitter=30)
+    scheduler.add_job(poll_render, "interval", minutes=2, id="poll_render", max_instances=1, jitter=30)
+    scheduler.add_job(poll_github, "interval", minutes=5, id="poll_github", max_instances=1, jitter=45)
+    scheduler.add_job(poll_render_metrics, "interval", minutes=10, id="render_metrics", max_instances=1, jitter=60)
+    scheduler.add_job(scan_render_logs, "interval", minutes=2, id="scan_render_logs", max_instances=1, jitter=30)
+    scheduler.add_job(scan_vercel_logs, "interval", minutes=2, id="scan_vercel_logs", max_instances=1, jitter=30)
+    scheduler.add_job(check_render_service_health, "interval", minutes=10, id="render_health", max_instances=1, jitter=60)
+    scheduler.add_job(check_vercel_service_health, "interval", minutes=10, id="vercel_health", max_instances=1, jitter=60)
+    scheduler.add_job(poll_supabase, "interval", minutes=5, id="poll_supabase", max_instances=1, jitter=45)
+    scheduler.add_job(scan_supabase_logs, "interval", minutes=5, id="scan_supabase_logs", max_instances=1, jitter=45)
+    scheduler.add_job(check_supabase_metrics, "interval", minutes=10, id="supabase_metrics", max_instances=1, jitter=60)
+    scheduler.add_job(check_endpoints, "interval", minutes=10, id="check_endpoints", max_instances=1, jitter=60)
     scheduler.add_job(cleanup_uptime_checks, "interval", hours=6, id="cleanup_uptime", max_instances=1)
     scheduler.add_job(cleanup_events, "interval", hours=6, id="cleanup_events", max_instances=1)
+    scheduler.add_job(_cache_evict, "interval", minutes=10, id="cache_evict", max_instances=1)
     scheduler.start()
     logger.info("Scheduler started")
 

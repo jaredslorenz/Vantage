@@ -39,11 +39,11 @@ export const RENDER_BG: Record<string, string> = {
 export function StatusDot({ state }: { state: string }) {
   const color = STATE_COLOR[state] ?? "#d1d5db";
   return (
-    <span className="relative flex items-center justify-center w-2.5 h-2.5 shrink-0">
+    <span className="relative flex items-center justify-center w-1.5 h-1.5 shrink-0">
       {state === "BUILDING" && (
         <span className="absolute inline-flex w-full h-full rounded-full opacity-75 animate-ping" style={{ background: color }} />
       )}
-      <span className="relative inline-flex w-2.5 h-2.5 rounded-full" style={{ background: color }} />
+      <span className="relative inline-flex w-1.5 h-1.5 rounded-full" style={{ background: color }} />
     </span>
   );
 }

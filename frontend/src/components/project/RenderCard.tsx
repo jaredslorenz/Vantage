@@ -49,9 +49,9 @@ export function RenderCard({ service, deploys, selected, onClick, onUnlink, onIn
             </span>
           ) : latest ? (
             <div className="flex items-center gap-1.5">
-              <span className="relative flex items-center justify-center w-2.5 h-2.5 shrink-0">
+              <span className="relative flex items-center justify-center w-1.5 h-1.5 shrink-0">
                 {isBuilding && <span className="absolute inline-flex w-full h-full rounded-full opacity-75 animate-ping" style={{ background: RENDER_COLOR[latest.status] }} />}
-                <span className="relative inline-flex w-2.5 h-2.5 rounded-full" style={{ background: RENDER_COLOR[latest.status] ?? "#d1d5db" }} />
+                <span className="relative inline-flex w-1.5 h-1.5 rounded-full" style={{ background: RENDER_COLOR[latest.status] ?? "#d1d5db" }} />
               </span>
               <span className="text-[11px] font-medium" style={{ color: RENDER_COLOR[latest.status] ?? "#d1d5db" }}>{RENDER_LABEL[latest.status] ?? latest.status}</span>
             </div>
@@ -69,10 +69,10 @@ export function RenderCard({ service, deploys, selected, onClick, onUnlink, onIn
         {[
           { label: "Deploys", value: String(deploys.length) },
           { label: "Success", value: successRate !== null ? `${successRate}%` : "—" },
-          { label: "Last", value: latest ? timeAgo(latest.created_at) : "—" },
+          { label: "Fails / 7d", value: String(weekFails), error: weekFails > 0 },
         ].map((stat) => (
           <div key={stat.label} className="bg-gray-50 rounded-lg px-2.5 py-2 text-center">
-            <div className="text-[15px] font-bold text-gray-900">{stat.value}</div>
+            <div className={`text-[15px] font-bold ${"error" in stat && stat.error ? "text-red-500" : "text-gray-900"}`}>{stat.value}</div>
             <div className="text-[9px] uppercase tracking-wider text-gray-400 mt-0.5">{stat.label}</div>
           </div>
         ))}
@@ -160,9 +160,9 @@ export function RenderDeployRow({ deploy, index, serviceId, maxBuildDuration, on
   return (
     <div className="animate-slide-up border-l-[3px] transition-all" style={{ borderLeftColor: color, animationDelay: `${index * 30}ms` }}>
       <div onClick={() => setExpanded((e) => !e)} className="w-full flex items-center gap-3 px-5 py-3.5 hover:bg-gray-50 transition-colors cursor-pointer group">
-        <span className="relative flex items-center justify-center w-2.5 h-2.5 shrink-0">
+        <span className="relative flex items-center justify-center w-1.5 h-1.5 shrink-0">
           {isBuilding && <span className="absolute inline-flex w-full h-full rounded-full opacity-75 animate-ping" style={{ background: color }} />}
-          <span className="relative inline-flex w-2.5 h-2.5 rounded-full" style={{ background: color }} />
+          <span className="relative inline-flex w-1.5 h-1.5 rounded-full" style={{ background: color }} />
         </span>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-0.5">
@@ -213,9 +213,11 @@ export function RenderDeployRow({ deploy, index, serviceId, maxBuildDuration, on
             </a>
             <button
               onClick={() => onViewLogs(
-                `/api/render/logs/${serviceId}/live?window=60`,
+                isBuilding
+                  ? `/api/render/logs/${serviceId}/live?window=60`
+                  : `/api/render/deploys/${serviceId}/${deploy.id}/logs`,
                 deploy.commit_id ?? deploy.id,
-                true,
+                false,
               )}
               className="text-[12px] font-medium px-3.5 py-1.5 rounded-button border border-gray-200 text-gray-600 hover:border-brand-purple hover:text-brand-purple transition-colors flex items-center gap-1.5"
             >

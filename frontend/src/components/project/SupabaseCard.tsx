@@ -13,13 +13,14 @@ export const SB_COLOR: Record<string, string> = {
 };
 
 // --- Supabase card ---
-export function SupabaseCard({ service, health, overview, selected, onClick, onUnlink, onInvestigate }: {
+export function SupabaseCard({ service, health, overview, selected, onClick, onUnlink, onInvestigate, hasRuntimeErrors }: {
   service: ProjectService; health: SupabaseServiceHealth[]; overview: SupabaseOverview | null;
   selected: boolean; onClick: () => void; onUnlink: () => void; onInvestigate?: () => void;
+  hasRuntimeErrors?: boolean;
 }) {
   const healthyCount = health.filter((s) => s.status === "ACTIVE_HEALTHY").length;
   const anyUnhealthy = health.some((s) => s.status === "ACTIVE_UNHEALTHY");
-  const hasIssue = anyUnhealthy && health.length > 0;
+  const hasIssue = (anyUnhealthy && health.length > 0) || !!hasRuntimeErrors;
   const overallColor = anyUnhealthy ? "#f87171" : health.length > 0 ? "#34d399" : "#fbbf24";
   const overallLabel = anyUnhealthy ? "Unhealthy" : health.length > 0 ? "Healthy" : "Starting";
   const totalRequests = overview?.api_stats.reduce((sum, p) => sum + p.count, 0) ?? null;

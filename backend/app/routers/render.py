@@ -14,6 +14,22 @@ RENDER_API = "https://api.render.com/v1"
 router = APIRouter(prefix="/api/render", tags=["render"])
 
 
+def _assert_owns_render_service(user_id: str, service_id: str) -> None:
+    """Raise 403 if service_id is not linked to a project owned by this user."""
+    projects = supabase.table("projects").select("id").eq("user_id", user_id).execute()
+    project_ids = [p["id"] for p in (projects.data or [])]
+    if not project_ids:
+        raise HTTPException(status_code=403, detail="Access denied")
+    result = supabase.table("project_services") \
+        .select("id") \
+        .eq("resource_id", service_id) \
+        .eq("service_type", "render") \
+        .in_("project_id", project_ids) \
+        .execute()
+    if not result.data:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
 def _get_render_token(user_id: str) -> str:
     cached = token_cache.get(user_id, "render")
     if cached:
@@ -113,6 +129,7 @@ async def get_services(user_id: str = Depends(get_user_id)):
 @router.get("/deploys/{service_id}/{deploy_id}/logs")
 async def get_deploy_logs(service_id: str, deploy_id: str, user_id: str = Depends(get_user_id)):
     """Fetch log lines for a Render deploy using the unified logs endpoint."""
+    _assert_owns_render_service(user_id, service_id)
     token = _get_render_token(user_id)
 
     # First fetch the deploy and service to get time window + ownerId
@@ -149,10 +166,7 @@ async def get_deploy_logs(service_id: str, deploy_id: str, user_id: str = Depend
         )
 
     if logs_resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Render logs API returned {logs_resp.status_code}: {logs_resp.text[:200]}",
-        )
+        raise HTTPException(status_code=502, detail="Failed to fetch logs from Render")
 
     raw = logs_resp.json()
     entries = raw.get("logs", raw) if isinstance(raw, dict) else raw
@@ -187,6 +201,7 @@ async def get_deploy_logs(service_id: str, deploy_id: str, user_id: str = Depend
 @router.get("/logs/{service_id}/live")
 async def get_live_logs(service_id: str, user_id: str = Depends(get_user_id), window: int = 30):
     """Fetch the last `window` seconds of logs for a service (for live streaming)."""
+    _assert_owns_render_service(user_id, service_id)
     token = _get_render_token(user_id)
 
     now = datetime.now(timezone.utc)
@@ -228,6 +243,7 @@ async def get_live_logs(service_id: str, user_id: str = Depends(get_user_id), wi
 @router.get("/metrics/{service_id}")
 async def get_service_metrics(service_id: str, user_id: str = Depends(get_user_id)):
     """Fetch CPU, memory, and HTTP request metrics for a Render service (last 60 min)."""
+    _assert_owns_render_service(user_id, service_id)
     token = _get_render_token(user_id)
 
     now = datetime.now(timezone.utc)
@@ -273,6 +289,46 @@ async def get_service_metrics(service_id: str, user_id: str = Depends(get_user_i
     }
 
 
+@router.get("/metrics/{service_id}/limits")
+async def get_service_limits(service_id: str, user_id: str = Depends(get_user_id)):
+    """Fetch the CPU and memory plan limits for a Render service.
+
+    Limit endpoints return the same time-series format as usage endpoints but with
+    constant values representing the plan's allocation (e.g. 0.1 cores, 536870912 bytes).
+    """
+    _assert_owns_render_service(user_id, service_id)
+    token = _get_render_token(user_id)
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    now = datetime.now(timezone.utc)
+    params = {
+        "resource": service_id,
+        "startTime": (now - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "resolutionSeconds": 60,
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        cpu_lim_resp, mem_lim_resp = await asyncio.gather(
+            client.get(f"{RENDER_API}/metrics/cpu-limit", headers=headers, params=params),
+            client.get(f"{RENDER_API}/metrics/memory-limit", headers=headers, params=params),
+            return_exceptions=True,
+        )
+
+    def _extract_limit(resp) -> float | None:
+        if isinstance(resp, Exception) or resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not isinstance(data, list) or not data:
+            return None
+        vals = [v["value"] for v in data[0].get("values", []) if v.get("value") is not None]
+        return vals[0] if vals else None
+
+    return {
+        "cpu": _extract_limit(cpu_lim_resp),
+        "memory": _extract_limit(mem_lim_resp),
+    }
+
+
 class TriggerDeployRequest(BaseModel):
     serviceId: str
     clearCache: bool = False
@@ -282,6 +338,7 @@ class TriggerDeployRequest(BaseModel):
 @router.post("/deploy")
 async def trigger_deploy(body: TriggerDeployRequest, user_id: str = Depends(get_user_id)):
     """Trigger a new deploy for a Render service. Pass commitId to roll back to a specific commit."""
+    _assert_owns_render_service(user_id, body.serviceId)
     token = _get_render_token(user_id)
 
     payload: dict = {"clearCache": "clear"} if body.clearCache else {}
@@ -313,6 +370,7 @@ async def get_deploys(
     limit: int = 20,
 ):
     """Fetch recent deploys for a Render service."""
+    _assert_owns_render_service(user_id, serviceId)
     token = _get_render_token(user_id)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)) as client:
