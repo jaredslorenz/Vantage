@@ -1,6 +1,7 @@
 import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -10,13 +11,11 @@ from app.core.limiter import limiter
 from app.routers import health, vercel, services, projects, github, render, insights, supabase_mgmt, events, uptime, webhooks
 from app.scheduler import start_scheduler, stop_scheduler
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     start_scheduler()
     yield
     stop_scheduler()
-
 
 app = FastAPI(title="Vantage API", version="0.1.0", lifespan=lifespan)
 app.state.limiter = limiter
@@ -29,6 +28,25 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+_ip_windows: dict[str, list[float]] = defaultdict(list)
+_GLOBAL_LIMIT = 200
+_GLOBAL_WINDOW = 60.0
+
+@app.middleware("http")
+async def global_rate_limit(request: Request, call_next):
+    # Skip health checks and static paths
+    if request.url.path in ("/health", "/"):
+        return await call_next(request)
+    ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    window = _ip_windows[ip]
+    _ip_windows[ip] = [t for t in window if now - t < _GLOBAL_WINDOW]
+    if len(_ip_windows[ip]) >= _GLOBAL_LIMIT:
+        return Response(content='{"detail":"Too many requests"}', status_code=429, media_type="application/json")
+    _ip_windows[ip].append(now)
+    return await call_next(request)
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):

@@ -2,7 +2,8 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from app.core.limiter import limiter
 from pydantic import BaseModel
 from app.core.encryption import encrypt_token, decrypt_token
 from app.core.security import get_user_id
@@ -336,7 +337,8 @@ class TriggerDeployRequest(BaseModel):
 
 
 @router.post("/deploy")
-async def trigger_deploy(body: TriggerDeployRequest, user_id: str = Depends(get_user_id)):
+@limiter.limit("5/minute")
+async def trigger_deploy(request: Request, body: TriggerDeployRequest, user_id: str = Depends(get_user_id)):
     """Trigger a new deploy for a Render service. Pass commitId to roll back to a specific commit."""
     _assert_owns_render_service(user_id, body.serviceId)
     token = _get_render_token(user_id)

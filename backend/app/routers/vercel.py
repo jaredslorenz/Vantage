@@ -3,7 +3,8 @@ import re
 import json
 from datetime import datetime, timezone, timedelta
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from app.core.limiter import limiter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from app.core.logger import logger
@@ -138,7 +139,8 @@ class RedeployRequest(BaseModel):
 
 
 @router.post("/redeploy")
-async def redeploy(body: RedeployRequest, user_id: str = Depends(get_user_id)):
+@limiter.limit("5/minute")
+async def redeploy(request: Request, body: RedeployRequest, user_id: str = Depends(get_user_id)):
     """Redeploy an existing Vercel deployment."""
     _assert_owns_vercel_project(user_id, body.projectId)
     token = _get_vercel_token(user_id)

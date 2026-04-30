@@ -1,5 +1,7 @@
 import ipaddress
 import time
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
 import httpx
 from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -93,22 +95,46 @@ async def check_uptime(request: Request, body: CheckRequest, user_id: str = Depe
 async def get_uptime_history(
     service_type: str = Query(...),
     service_id: str = Query(...),
-    limit: int = Query(60, ge=1, le=200),
     user_id: str = Depends(get_user_id),
 ):
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     try:
         result = supabase.table("uptime_checks") \
-            .select("is_up,status_code,latency_ms,checked_at") \
+            .select("is_up,latency_ms,checked_at") \
             .eq("user_id", user_id) \
             .eq("service_type", service_type) \
             .eq("service_id", service_id) \
-            .order("checked_at", desc=True) \
-            .limit(limit) \
+            .gte("checked_at", cutoff) \
+            .order("checked_at", desc=False) \
             .execute()
-        checks = list(reversed(result.data or []))
+        checks = result.data or []
     except Exception as exc:
         logger.error("Failed to fetch uptime history error=%s", exc)
         checks = []
+
+    # Aggregate into 24 hourly buckets
+    hourly: dict[str, list] = defaultdict(list)
+    for c in checks:
+        hour_key = c["checked_at"][:13]  # "2024-01-01T12"
+        hourly[hour_key].append(c)
+
+    now = datetime.now(timezone.utc)
+    buckets = []
+    for i in range(24):
+        d = now - timedelta(hours=(23 - i))
+        hour_key = d.strftime("%Y-%m-%dT%H")
+        slot = hourly.get(hour_key, [])
+        if slot:
+            up_count = sum(1 for c in slot if c["is_up"])
+            latencies = [c["latency_ms"] for c in slot if c.get("latency_ms") is not None]
+            buckets.append({
+                "hour": hour_key,
+                "uptime_pct": round(up_count / len(slot) * 100),
+                "avg_latency_ms": round(sum(latencies) / len(latencies)) if latencies else None,
+                "total": len(slot),
+            })
+        else:
+            buckets.append({"hour": hour_key, "uptime_pct": None, "avg_latency_ms": None, "total": 0})
 
     total = len(checks)
     up_count = sum(1 for c in checks if c["is_up"])
@@ -117,7 +143,7 @@ async def get_uptime_history(
     avg_latency = round(sum(latencies) / len(latencies)) if latencies else None
 
     return {
-        "checks": checks,
+        "buckets": buckets,
         "uptime_pct": uptime_pct,
         "avg_latency_ms": avg_latency,
         "total": total,

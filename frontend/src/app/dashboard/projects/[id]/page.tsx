@@ -9,7 +9,7 @@ import { groupByDate, timeAgo } from "@/lib/utils";
 import type {
   Project, ProjectService, Deployment, Commit, PullRequest,
   RenderDeploy, VercelProject, GitHubRepo, RenderService,
-  SupabaseProject, SupabaseServiceHealth, SupabaseOverview, SupabaseFunction, SupabaseStorage, SupabaseConfig, SupabaseTraffic, SupabaseTrafficDaily,
+  SupabaseProject, SupabaseServiceHealth, SupabaseOverview, SupabaseFunction, SupabaseStorage, SupabaseConfig, SupabaseTraffic, SupabaseTrafficDaily, SupabaseAnalytics,
   DeployAnalysis, UptimeStatus, EnvVar, LogLine, RuntimeError,
 } from "@/types/project";
 import { InsightPanel } from "@/components/project/InsightPanel";
@@ -24,6 +24,7 @@ import { GitHubCard, CommitRow, PRRow } from "@/components/project/GitHubCard";
 import { SupabaseCard, SB_COLOR } from "@/components/project/SupabaseCard";
 import { SupabaseMetricsChart } from "@/components/project/SupabaseMetricsChart";
 import { SupabaseLogsPanel } from "@/components/project/SupabaseLogsPanel";
+import { LiveLogsCard } from "@/components/project/SupabaseLiveLogsCard";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 
 // --- Log drawer ---
@@ -419,6 +420,8 @@ export default function ProjectPage() {
   const [supabaseConfig, setSupabaseConfig] = useState<SupabaseConfig | null>(null);
   const [supabaseTraffic, setSupabaseTraffic] = useState<SupabaseTraffic | null>(null);
   const [supabaseTrafficDaily, setSupabaseTrafficDaily] = useState<SupabaseTrafficDaily | null>(null);
+  const [supabaseAnalytics, setSupabaseAnalytics] = useState<SupabaseAnalytics | null>(null);
+  const [supabaseAnalyticsTab, setSupabaseAnalyticsTab] = useState<"latency" | "funnel" | "queries" | "actions">("latency");
   const [loading, setLoading] = useState(true);
   const [selectedService, setSelectedService] = useState<string | null>(null);
   const [showLinkPanel, setShowLinkPanel] = useState(false);
@@ -486,21 +489,28 @@ export default function ProjectPage() {
           );
         }
         if (supabaseSvc) {
+          const ref = supabaseSvc.resource_id;
+          // Batch 1: visible cards first
           fetches.push(
-            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/health`)
-              .then((r) => r.json()).then((d) => setSupabaseHealth(d.services ?? [])).catch(() => {}),
-            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/overview`)
-              .then((r) => r.json()).then((d) => setSupabaseOverview(d)).catch(() => {}),
-            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/functions`)
-              .then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseFunctions(d.functions ?? []); }).catch(() => {}),
-            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/storage`)
-              .then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseStorage(d); }).catch(() => {}),
-            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/config`)
-              .then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseConfig(d); }).catch(() => {}),
-            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/traffic`)
-              .then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseTraffic(d); }).catch(() => {}),
-            apiFetch(`/api/supabase/projects/${supabaseSvc.resource_id}/traffic/daily`)
-              .then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseTrafficDaily(d); }).catch(() => {})
+            apiFetch(`/api/supabase/projects/${ref}/health`).then((r) => r.json()).then((d) => setSupabaseHealth(d.services ?? [])).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${ref}/overview`).then((r) => r.json()).then((d) => setSupabaseOverview(d)).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${ref}/traffic`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseTraffic(d); }).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${ref}/config`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseConfig(d); }).catch(() => {}),
+          );
+          // Batch 2: secondary data after 400ms delay
+          fetches.push(
+            new Promise<void>((resolve) => setTimeout(resolve, 400)).then(() => Promise.all([
+              apiFetch(`/api/supabase/projects/${ref}/metrics`).then((r) => r.ok ? r.json() : null).catch(() => null),
+              apiFetch(`/api/supabase/projects/${ref}/traffic/daily`).then((r) => r.ok ? r.json() : null).catch(() => null),
+              apiFetch(`/api/supabase/projects/${ref}/analytics`).then((r) => r.ok ? r.json() : null).catch(() => null),
+              apiFetch(`/api/supabase/projects/${ref}/functions`).then((r) => r.ok ? r.json() : null).catch(() => null),
+              apiFetch(`/api/supabase/projects/${ref}/storage`).then((r) => r.ok ? r.json() : null).catch(() => null),
+            ])).then(([, daily, analytics, functions, storage]) => {
+              if (daily) { console.log("[traffic/hourly]", JSON.stringify(daily)); setSupabaseTrafficDaily(daily); }
+              if (analytics) setSupabaseAnalytics(analytics);
+              if (functions) setSupabaseFunctions(functions.functions ?? []);
+              if (storage) setSupabaseStorage(storage);
+            }).catch(() => {})
           );
         }
         return Promise.all(fetches);
@@ -608,7 +618,7 @@ export default function ProjectPage() {
           body: JSON.stringify({ url, service_type: serviceType, service_id: serviceId }),
         });
         const check = await checkRes.json();
-        setUptimeData((prev) => ({ ...prev, [key]: { ...check, uptime_pct: null, avg_latency_ms: null, checks: [] } }));
+        setUptimeData((prev) => ({ ...prev, [key]: { ...check, uptime_pct: null, avg_latency_ms: null, buckets: [] } }));
         const histRes = await apiFetch(`/api/uptime/history?service_type=${serviceType}&service_id=${serviceId}`);
         const hist = await histRes.json();
         setUptimeData((prev) => ({ ...prev, [key]: { ...prev[key], ...hist } }));
@@ -674,11 +684,15 @@ export default function ProjectPage() {
           await Promise.all([
             apiFetch(`/api/supabase/projects/${resourceId}/health`).then((r) => r.json()).then((d) => setSupabaseHealth(d.services ?? [])).catch(() => {}),
             apiFetch(`/api/supabase/projects/${resourceId}/overview`).then((r) => r.json()).then((d) => setSupabaseOverview(d)).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${resourceId}/traffic`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseTraffic(d); }).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${resourceId}/config`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseConfig(d); }).catch(() => {}),
+          ]);
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          await Promise.all([
+            apiFetch(`/api/supabase/projects/${resourceId}/traffic/daily`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseTrafficDaily(d); }).catch(() => {}),
+            apiFetch(`/api/supabase/projects/${resourceId}/analytics`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseAnalytics(d); }).catch(() => {}),
             apiFetch(`/api/supabase/projects/${resourceId}/functions`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseFunctions(d.functions ?? []); }).catch(() => {}),
             apiFetch(`/api/supabase/projects/${resourceId}/storage`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseStorage(d); }).catch(() => {}),
-            apiFetch(`/api/supabase/projects/${resourceId}/config`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseConfig(d); }).catch(() => {}),
-            apiFetch(`/api/supabase/projects/${resourceId}/traffic`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseTraffic(d); }).catch(() => {}),
-            apiFetch(`/api/supabase/projects/${resourceId}/traffic/daily`).then((r) => r.ok ? r.json() : null).then((d) => { if (d) setSupabaseTrafficDaily(d); }).catch(() => {}),
           ]);
         } else {
           await apiFetch(`/api/vercel/deployments?limit=20&projectId=${resourceId}`).then((r) => r.json()).then((d) => setDeployments(d.deployments ?? [])).catch(() => {});
@@ -725,7 +739,7 @@ export default function ProjectPage() {
     if (serviceType === "vercel") setDeployments([]);
     if (serviceType === "github") { setCommits([]); setPulls([]); }
     if (serviceType === "render") setRenderDeploys([]);
-    if (serviceType === "supabase") { setSupabaseHealth([]); setSupabaseOverview(null); setSupabaseFunctions([]); setSupabaseStorage(null); setSupabaseConfig(null); setSupabaseTraffic(null); setSupabaseTrafficDaily(null); }
+    if (serviceType === "supabase") { setSupabaseHealth([]); setSupabaseOverview(null); setSupabaseFunctions([]); setSupabaseStorage(null); setSupabaseConfig(null); setSupabaseTraffic(null); setSupabaseTrafficDaily(null); setSupabaseAnalytics(null); }
   };
 
 
@@ -1029,19 +1043,19 @@ export default function ProjectPage() {
                       </div>
                       <DORAMetrics deployments={deployments} inline />
                     </div>
-                    {vercelUptime && vercelUptime.checks.length > 0 && (
+                    {vercelUptime && vercelUptime.buckets.length > 0 && (
                       <div className="px-5 py-3">
                         <div className="flex items-center justify-between mb-1.5">
-                          <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Uptime</p>
+                          <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Uptime <span className="font-normal text-gray-300 normal-case">24h</span></p>
                           <div className="flex items-center gap-3 text-[10px] text-gray-400">
                             {vercelUptime.uptime_pct != null && <span className="font-medium text-gray-600">{vercelUptime.uptime_pct}%</span>}
                             {vercelUptime.avg_latency_ms != null && <span>{vercelUptime.avg_latency_ms}ms avg</span>}
                           </div>
                         </div>
                         <div className="flex gap-0.5">
-                          {vercelUptime.checks.map((c, i) => (
-                            <div key={i} title={`${c.is_up ? "Up" : "Down"} — ${new Date(c.checked_at).toLocaleString()}`}
-                              className={`flex-1 h-5 rounded-sm ${c.is_up ? "bg-emerald-400/70" : "bg-red-400/80"}`} />
+                          {vercelUptime.buckets.map((b, i) => (
+                            <div key={i} title={`${b.hour} — ${b.uptime_pct ?? "No data"}% uptime${b.avg_latency_ms != null ? `, ${b.avg_latency_ms}ms avg` : ""}`}
+                              className={`flex-1 h-5 rounded-sm ${b.uptime_pct === null ? "bg-gray-100" : b.uptime_pct === 100 ? "bg-emerald-400/70" : b.uptime_pct >= 80 ? "bg-amber-400/70" : "bg-red-400/80"}`} />
                           ))}
                         </div>
                       </div>
@@ -1278,19 +1292,19 @@ export default function ProjectPage() {
                           </div>
                         )}
                       </div>
-                      {renderUptime && renderUptime.checks.length > 0 && (
+                      {renderUptime && renderUptime.buckets.length > 0 && (
                         <div className="px-5 py-3 border-t border-gray-100">
                           <div className="flex items-center justify-between mb-1.5">
-                            <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Uptime</p>
+                            <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Uptime <span className="font-normal text-gray-300 normal-case">24h</span></p>
                             <div className="flex items-center gap-3 text-[10px] text-gray-400">
                               {renderUptime.uptime_pct != null && <span className="font-medium text-gray-600">{renderUptime.uptime_pct}%</span>}
                               {renderUptime.avg_latency_ms != null && <span>{renderUptime.avg_latency_ms}ms avg</span>}
                             </div>
                           </div>
                           <div className="flex gap-0.5">
-                            {renderUptime.checks.map((c, i) => (
-                              <div key={i} title={`${c.is_up ? "Up" : "Down"} — ${new Date(c.checked_at).toLocaleString()}`}
-                                className={`flex-1 h-5 rounded-sm ${c.is_up ? "bg-emerald-400/70" : "bg-red-400/80"}`} />
+                            {renderUptime.buckets.map((b, i) => (
+                              <div key={i} title={`${b.hour} — ${b.uptime_pct ?? "No data"}% uptime${b.avg_latency_ms != null ? `, ${b.avg_latency_ms}ms avg` : ""}`}
+                                className={`flex-1 h-5 rounded-sm ${b.uptime_pct === null ? "bg-gray-100" : b.uptime_pct === 100 ? "bg-emerald-400/70" : b.uptime_pct >= 80 ? "bg-amber-400/70" : "bg-red-400/80"}`} />
                             ))}
                           </div>
                         </div>
@@ -1381,7 +1395,7 @@ export default function ProjectPage() {
                                 <div className="divide-y divide-gray-100">
                                   {metricAlerts.map((e) => (
                                     <div key={e.id} className="px-5 py-3 flex items-center gap-3">
-                                      <span className="text-base shrink-0">{e.metadata?.alert_type === "memory" ? "🧠" : "⚡"}</span>
+                                      <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${e.metadata?.alert_type === "memory" ? "bg-amber-400" : "bg-orange-400"}`} />
                                       <div className="flex-1 min-w-0">
                                         <p className="text-[12px] font-medium text-gray-800">{e.title}</p>
                                         <p className="text-[11px] text-gray-500 truncate">{e.subtitle}</p>
@@ -1464,181 +1478,130 @@ export default function ProjectPage() {
                 spotify: "♪", twitch: "t", azure: "Az", bitbucket: "⚙", notion: "N",
                 zoom: "z", keycloak: "🔑",
               };
+              const ANALYTICS_TABS = [
+                { id: "latency", label: "Latency" },
+                { id: "funnel", label: "Auth Funnel" },
+                { id: "queries", label: "Slow Queries" },
+                { id: "actions", label: "Actions" },
+              ] as const;
               return (
                 <div className="space-y-3">
-                  {/* Row 0: Project config + Auth providers */}
+                  {/* Row 1: Services & Traffic + Infrastructure */}
                   <div className="grid grid-cols-2 gap-3">
-                    {/* Project details */}
-                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
-                      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
-                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Project</p>
-                      </div>
-                      {!supabaseConfig ? (
-                        <div className="space-y-2 px-5 py-3 animate-pulse">{[0,1,2].map(i => <div key={i} className="h-5 bg-gray-50 rounded" />)}</div>
-                      ) : (
-                        <div className="px-5 py-3 space-y-2.5">
-                          {[
-                            { label: "Region", value: supabaseConfig.project?.region ?? null },
-                            { label: "DB Host", value: supabaseConfig.project?.db_host ?? null, mono: true },
-                            { label: "Status", value: supabaseConfig.project?.status?.replace(/_/g, " ") ?? null },
-                            { label: "Created", value: supabaseConfig.project?.created_at ? new Date(supabaseConfig.project.created_at).toLocaleDateString() : null },
-                          ].map(({ label, value, mono }) => (
-                            <div key={label} className="flex items-center justify-between gap-3">
-                              <span className="text-[10px] text-gray-400 uppercase tracking-wider shrink-0">{label}</span>
-                              <span className={`text-[11px] text-gray-700 truncate ${mono ? "font-mono" : "font-medium"}`}>{value ?? "—"}</span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Auth providers */}
-                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
-                      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
-                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Auth</p>
-                        {supabaseConfig?.auth && (
-                          <div className="flex items-center gap-2">
-                            {supabaseConfig.auth.mfa_enabled && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-brand-purple/10 text-brand-purple">MFA</span>}
-                            {supabaseConfig.auth.anonymous_sign_ins && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-500">Anon</span>}
-                          </div>
-                        )}
-                      </div>
-                      {!supabaseConfig ? (
-                        <div className="space-y-2 px-5 py-3 animate-pulse">{[0,1].map(i => <div key={i} className="h-8 bg-gray-50 rounded" />)}</div>
-                      ) : (
-                        <div className="px-5 py-3 space-y-3">
-                          {supabaseConfig.auth?.site_url && (
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="text-[10px] text-gray-400 uppercase tracking-wider shrink-0">Site URL</span>
-                              <span className="text-[11px] text-gray-600 font-mono truncate">{supabaseConfig.auth.site_url}</span>
-                            </div>
-                          )}
-                          {supabaseConfig.auth?.min_password_length != null && (
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="text-[10px] text-gray-400 uppercase tracking-wider shrink-0">Min Password</span>
-                              <span className="text-[11px] text-gray-700 font-medium">{supabaseConfig.auth.min_password_length} chars</span>
-                            </div>
-                          )}
-                          <div>
-                            <p className="text-[10px] text-gray-400 uppercase tracking-wider mb-1.5">Providers</p>
-                            {(supabaseConfig.auth?.providers ?? []).length === 0 ? (
-                              <p className="text-[11px] text-gray-400">No external providers enabled</p>
-                            ) : (
-                              <div className="flex flex-wrap gap-1.5">
-                                {(supabaseConfig.auth?.providers ?? []).map((p) => (
-                                  <span key={p} className="flex items-center gap-1 text-[10px] font-medium px-2 py-1 rounded-full bg-gray-100 text-gray-600 capitalize">
-                                    <span className="text-[9px]">{PROVIDER_ICONS[p] ?? "○"}</span>
-                                    {p}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Row 1: Services + Infrastructure */}
-                  <div className="grid grid-cols-2 gap-3">
-                    {/* Services — enriched with per-service traffic breakdown */}
+                    {/* Services & Traffic — merged */}
                     <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden flex flex-col">
                       <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
-                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Services</p>
-                        {supabaseHealth.length > 0 && (
-                          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${healthyCount === supabaseHealth.length ? "bg-emerald-50 text-emerald-600" : "bg-red-50 text-red-500"}`}>
-                            {healthyCount}/{supabaseHealth.length} healthy
-                          </span>
-                        )}
+                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Services & Traffic</p>
+                        <div className="flex items-center gap-2">
+                          {supabaseHealth.length > 0 && (
+                            <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${healthyCount === supabaseHealth.length ? "bg-emerald-50 text-emerald-600" : "bg-red-50 text-red-500"}`}>
+                              {healthyCount}/{supabaseHealth.length} healthy
+                            </span>
+                          )}
+                          {supabaseTraffic?.available && (
+                            <span className="text-[10px] text-gray-400">24h</span>
+                          )}
+                        </div>
                       </div>
+
+                      {/* Traffic bar chart */}
+                      {supabaseTraffic?.available ? (() => {
+                        const SERVICES = ["auth", "database", "storage", "functions", "realtime"];
+                        const map = Object.fromEntries(supabaseTraffic.breakdown.map((r) => [r.service, r]));
+                        const chartData = SERVICES.map((svc) => ({
+                          service: svc.charAt(0).toUpperCase() + svc.slice(1),
+                          requests: map[svc]?.total ?? 0,
+                          errors: map[svc]?.errors ?? 0,
+                        }));
+                        return (
+                          <div className="px-4 pt-3 pb-1 border-b border-gray-100">
+                            <ResponsiveContainer width="100%" height={110}>
+                              <BarChart data={chartData} margin={{ top: 2, right: 4, left: -28, bottom: 0 }} barCategoryGap="30%">
+                                <defs>
+                                  <linearGradient id="sbBarGrad" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor="#6f7bf7" stopOpacity={0.85} />
+                                    <stop offset="100%" stopColor="#6f7bf7" stopOpacity={0.4} />
+                                  </linearGradient>
+                                </defs>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false} />
+                                <XAxis dataKey="service" tick={{ fontSize: 9, fill: "#9ca3af" }} axisLine={false} tickLine={false} />
+                                <YAxis tick={{ fontSize: 9, fill: "#d1d5db" }} axisLine={false} tickLine={false} tickFormatter={(v: number) => v >= 1000 ? `${(v/1000).toFixed(0)}k` : String(v)} />
+                                <Tooltip
+                                  contentStyle={{ fontSize: 11, borderRadius: 8, border: "1px solid #e5e7eb", padding: "4px 10px" }}
+                                  formatter={(v, name) => [Number(v).toLocaleString(), name === "errors" ? "Errors" : "Requests"]}
+                                />
+                                <Bar dataKey="requests" stackId="a" fill="url(#sbBarGrad)" radius={[0,0,0,0]} />
+                                <Bar dataKey="errors" stackId="a" fill="#f87171" fillOpacity={0.8} radius={[3,3,0,0]} />
+                              </BarChart>
+                            </ResponsiveContainer>
+                          </div>
+                        );
+                      })() : !supabaseTraffic ? (
+                        <div className="h-20 mx-4 my-3 bg-gray-50 rounded-lg animate-pulse" />
+                      ) : null}
+
+                      {/* Service health list with sparklines */}
                       <div className="divide-y divide-gray-100 flex-1">
                         {supabaseHealth.length === 0
-                          ? <div className="px-5 py-3 animate-pulse space-y-2">{[0,1,2,3].map(i => <div key={i} className="h-10 bg-gray-50 rounded-lg" />)}</div>
-                          : (() => {
-                              return supabaseHealth.map((s) => {
-                                const slug = s.name === "db" ? "database" : s.name;
-                                const traffic = supabaseTraffic?.breakdown.find(t => t.service === slug);
-                                const errRate = traffic && traffic.total > 0 ? Math.round((traffic.errors / traffic.total) * 100) : 0;
-                                return (
-                                  <div key={s.name} className={`px-4 py-3 ${s.status === "ACTIVE_UNHEALTHY" ? "bg-red-50/40" : ""}`}>
-                                    <div className="flex items-center gap-2.5 mb-1.5">
-                                      <span className="w-2 h-2 rounded-full shrink-0" style={{ background: SB_COLOR[s.status] ?? "#d1d5db" }} />
-                                      <span className="text-[12px] font-semibold text-gray-700 capitalize flex-1">{s.name.replace(/_/g, " ")}</span>
-                                      {traffic ? (
-                                        <div className="flex items-center gap-2 shrink-0">
-                                          <span className="text-[11px] font-semibold text-gray-800">
-                                            {traffic.total >= 1000 ? `${(traffic.total/1000).toFixed(1)}k` : traffic.total}
-                                            <span className="text-[9px] font-normal text-gray-400 ml-0.5">req</span>
-                                          </span>
-                                          {traffic.errors > 0 ? (
-                                            <span className="text-[10px] font-semibold text-red-500 bg-red-50 border border-red-100 px-1.5 py-0.5 rounded-full">
-                                              {errRate > 0 ? `${errRate}%` : traffic.errors} err
-                                            </span>
-                                          ) : (
-                                            <span className="text-[10px] text-emerald-500">✓</span>
-                                          )}
-                                        </div>
-                                      ) : (
-                                        <span className={`text-[10px] font-medium shrink-0 ${
-                                          s.status === "ACTIVE_HEALTHY" ? "text-emerald-500" :
-                                          s.status === "ACTIVE_UNHEALTHY" ? "text-red-500" :
-                                          s.status === "COMING_UP" ? "text-amber-500" : "text-gray-400"
-                                        }`}>{s.status === "ACTIVE_HEALTHY" ? "healthy" : s.status === "ACTIVE_UNHEALTHY" ? "unhealthy" : s.status === "COMING_UP" ? "starting" : "inactive"}</span>
-                                      )}
-                                    </div>
-                                    {(() => {
-                                      // Scaffold last 7 days so chart always fills the full width
-                                      const last7 = Array.from({ length: 7 }, (_, i) => {
-                                        const d = new Date();
-                                        d.setDate(d.getDate() - (6 - i));
-                                        return d.toISOString().slice(0, 10);
-                                      });
-                                      const dailyMap = Object.fromEntries(
-                                        (supabaseTrafficDaily?.services?.[slug] ?? []).map((r) => [r.day, r])
-                                      );
-                                      const sparkData = last7.map((iso) => ({
-                                        day: new Date(iso + "T12:00:00").toLocaleDateString("en-US", { weekday: "short" }),
-                                        total: dailyMap[iso]?.total ?? 0,
-                                        errors: dailyMap[iso]?.errors ?? 0,
-                                      }));
-                                      const hasAny = sparkData.some((d) => d.total > 0);
-                                      if (!hasAny) return null;
-                                      return (
-                                        <div className="ml-4 mt-1.5">
-                                          <ResponsiveContainer width="100%" height={52}>
-                                            <BarChart data={sparkData} margin={{ top: 2, right: 0, left: 0, bottom: 0 }} barCategoryGap="25%">
-                                              <XAxis dataKey="day" tick={{ fontSize: 9, fill: "#9ca3af" }} axisLine={false} tickLine={false} />
-                                              <Bar dataKey="total" stackId="s" fill="#6f7bf7" fillOpacity={0.4} radius={[0,0,0,0]} />
-                                              <Bar dataKey="errors" stackId="s" fill="#f87171" fillOpacity={0.85} radius={[2,2,0,0]} />
-                                              <Tooltip
-                                                contentStyle={{ fontSize: 10, borderRadius: 6, border: "1px solid #e5e7eb", padding: "2px 8px" }}
-                                                formatter={(v, name) => [Number(v).toLocaleString(), name === "errors" ? "Errors" : "Requests"]}
-                                                labelFormatter={(l) => l}
-                                              />
-                                            </BarChart>
-                                          </ResponsiveContainer>
-                                        </div>
-                                      );
-                                    })()}
-                                  </div>
-                                );
+                          ? <div className="px-5 py-3 animate-pulse space-y-2">{[0,1,2,3].map(i => <div key={i} className="h-8 bg-gray-50 rounded-lg" />)}</div>
+                          : supabaseHealth.map((s) => {
+                              const slug = s.name === "db" ? "database" : s.name;
+                              const last24 = Array.from({ length: 24 }, (_, i) => {
+                                const d = new Date(); d.setMinutes(0, 0, 0);
+                                d.setHours(d.getHours() - (23 - i));
+                                const utcKey = d.toISOString().slice(0, 13).replace("T", " ");
+                                const label = d.toLocaleTimeString("en-US", { hour: "numeric", hour12: true });
+                                return { utcKey, label };
                               });
-                            })()
+                              const hourlyMap = Object.fromEntries(
+                                (supabaseTrafficDaily?.services?.[slug] ?? []).map((r) => [r.day, r])
+                              );
+                              const sparkData = last24.map(({ utcKey, label }) => ({
+                                day: label,
+                                total: hourlyMap[utcKey]?.total ?? 0,
+                                errors: hourlyMap[utcKey]?.errors ?? 0,
+                              }));
+                              const hasSpark = sparkData.some((d) => d.total > 0);
+                              const svcTraffic = supabaseTraffic?.breakdown.find(t => t.service === slug);
+                              const errRate = svcTraffic && svcTraffic.total > 0 ? Math.round((svcTraffic.errors / svcTraffic.total) * 100) : 0;
+                              return (
+                                <div key={s.name} className={`px-4 py-2.5 ${s.status === "ACTIVE_UNHEALTHY" ? "bg-red-50/40" : ""}`}>
+                                  <div className="flex items-center gap-2.5 mb-1">
+                                    <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: SB_COLOR[s.status] ?? "#d1d5db" }} />
+                                    <span className="text-[12px] font-semibold text-gray-700 capitalize flex-1">{s.name.replace(/_/g, " ")}</span>
+                                    {svcTraffic && svcTraffic.total > 0 ? (
+                                      <div className="flex items-center gap-1.5 shrink-0">
+                                        <span className="text-[11px] font-semibold text-gray-700">{svcTraffic.total >= 1000 ? `${(svcTraffic.total/1000).toFixed(1)}k` : svcTraffic.total}<span className="text-[9px] font-normal text-gray-400 ml-0.5">req</span></span>
+                                        {svcTraffic.errors > 0 && <span className="text-[9px] font-semibold text-red-500 bg-red-50 border border-red-100 px-1.5 py-0.5 rounded-full">{errRate}% err</span>}
+                                      </div>
+                                    ) : (
+                                      <span className={`text-[10px] font-medium shrink-0 ${
+                                        s.status === "ACTIVE_HEALTHY" ? "text-emerald-500" :
+                                        s.status === "ACTIVE_UNHEALTHY" ? "text-red-500" :
+                                        s.status === "COMING_UP" ? "text-amber-500" : "text-gray-400"
+                                      }`}>{s.status === "ACTIVE_HEALTHY" ? "healthy" : s.status === "ACTIVE_UNHEALTHY" ? "unhealthy" : s.status === "COMING_UP" ? "starting" : "inactive"}</span>
+                                    )}
+                                  </div>
+                                  {hasSpark && (
+                                    <div className="ml-4">
+                                      <ResponsiveContainer width="100%" height={40}>
+                                        <BarChart data={sparkData} margin={{ top: 0, right: 0, left: 0, bottom: 0 }} barCategoryGap="20%">
+                                          <XAxis dataKey="day" tick={{ fontSize: 8, fill: "#d1d5db" }} axisLine={false} tickLine={false} interval={5} />
+                                          <Bar dataKey="total" stackId="s" fill="#6f7bf7" fillOpacity={0.3} radius={[0,0,0,0]} minPointSize={2} />
+                                          <Bar dataKey="errors" stackId="s" fill="#f87171" fillOpacity={0.8} radius={[2,2,0,0]} />
+                                          <Tooltip
+                                            contentStyle={{ fontSize: 10, borderRadius: 6, border: "1px solid #e5e7eb", padding: "2px 8px" }}
+                                            formatter={(v, name) => [Number(v).toLocaleString(), name === "errors" ? "Errors" : "Requests"]}
+                                          />
+                                        </BarChart>
+                                      </ResponsiveContainer>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })
                         }
                       </div>
-                      {supabaseTraffic?.available && supabaseTraffic.breakdown.length > 0 && (
-                        <div className="px-5 py-2.5 border-t border-gray-100 bg-gray-50/40 flex items-center justify-between">
-                          <span className="text-[10px] text-gray-400">Total (24h)</span>
-                          <span className="text-[11px] font-semibold text-gray-700">
-                            {(() => { const t = supabaseTraffic.breakdown.reduce((s, r) => s + r.total, 0); return t >= 1000 ? `${(t/1000).toFixed(1)}k` : t; })()} req
-                            {supabaseTraffic.breakdown.some(r => r.errors > 0) && (
-                              <span className="ml-2 text-red-500">
-                                / {supabaseTraffic.breakdown.reduce((s, r) => s + r.errors, 0)} err
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                      )}
                     </div>
 
                     {/* Infrastructure */}
@@ -1650,81 +1613,9 @@ export default function ProjectPage() {
                     </div>
                   </div>
 
-                  {/* Row 2: API Traffic + Error Logs */}
+                  {/* Row 2: Live Logs + Error Logs */}
                   <div className="grid grid-cols-2 gap-3">
-                    {/* API Traffic */}
-                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden flex flex-col">
-                      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
-                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">API Traffic</p>
-                        <span className="text-[10px] text-gray-400">
-                          {supabaseTraffic?.available ? "Last 24h by service" : "Last 7 days"}
-                        </span>
-                      </div>
-                      <div className="px-4 py-3 flex-1">
-                        {/* Primary: per-service 24h breakdown from /traffic */}
-                        {supabaseTraffic?.available && supabaseTraffic.breakdown.length > 0 ? (() => {
-                          const chartData = supabaseTraffic.breakdown.map((r) => ({
-                            service: r.service.charAt(0).toUpperCase() + r.service.slice(1),
-                            requests: r.total,
-                            errors: r.errors,
-                          }));
-                          return (
-                            <ResponsiveContainer width="100%" height={180}>
-                              <BarChart data={chartData} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
-                                <defs>
-                                  <linearGradient id="sbBarGrad" x1="0" y1="0" x2="0" y2="1">
-                                    <stop offset="0%" stopColor="#6f7bf7" stopOpacity={0.9} />
-                                    <stop offset="100%" stopColor="#6f7bf7" stopOpacity={0.4} />
-                                  </linearGradient>
-                                </defs>
-                                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
-                                <XAxis dataKey="service" tick={{ fontSize: 9, fill: "#9ca3af" }} axisLine={false} tickLine={false} />
-                                <YAxis tick={{ fontSize: 9, fill: "#9ca3af" }} axisLine={false} tickLine={false} tickFormatter={(v: number) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : String(v)} />
-                                <Tooltip
-                                  contentStyle={{ fontSize: 11, borderRadius: 8, border: "1px solid #e5e7eb", padding: "4px 10px" }}
-                                  formatter={(v, name) => [Number(v).toLocaleString(), name === "errors" ? "Errors" : "Requests"]}
-                                />
-                                <Bar dataKey="requests" stackId="a" fill="url(#sbBarGrad)" radius={[0, 0, 0, 0]} barSize={48} />
-                                <Bar dataKey="errors" stackId="a" fill="#f87171" radius={[3, 3, 0, 0]} barSize={48} />
-                              </BarChart>
-                            </ResponsiveContainer>
-                          );
-                        })()
-                        /* Fallback: daily totals from overview if traffic isn't available */
-                        : !supabaseTraffic ? (
-                          <div className="h-32 bg-gray-50 rounded-lg animate-pulse" />
-                        ) : supabaseOverview?.api_stats && supabaseOverview.api_stats.length > 0 ? (() => {
-                          const chartData = supabaseOverview.api_stats.slice(-7).map((p) => ({
-                            day: new Date(p.timestamp).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
-                            requests: p.count,
-                          }));
-                          return (
-                            <ResponsiveContainer width="100%" height={160}>
-                              <BarChart data={chartData} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
-                                <defs>
-                                  <linearGradient id="sbBarGrad2" x1="0" y1="0" x2="0" y2="1">
-                                    <stop offset="0%" stopColor="#6f7bf7" stopOpacity={0.9} />
-                                    <stop offset="100%" stopColor="#6f7bf7" stopOpacity={0.4} />
-                                  </linearGradient>
-                                </defs>
-                                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
-                                <XAxis dataKey="day" tick={{ fontSize: 9, fill: "#9ca3af" }} axisLine={false} tickLine={false} />
-                                <YAxis tick={{ fontSize: 9, fill: "#9ca3af" }} axisLine={false} tickLine={false} tickFormatter={(v: number) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : String(v)} />
-                                <Tooltip
-                                  contentStyle={{ fontSize: 11, borderRadius: 8, border: "1px solid #e5e7eb", padding: "4px 10px" }}
-                                  formatter={(v) => [Number(v).toLocaleString(), "Requests"]}
-                                />
-                                <Bar dataKey="requests" fill="url(#sbBarGrad2)" radius={[3, 3, 0, 0]} />
-                              </BarChart>
-                            </ResponsiveContainer>
-                          );
-                        })() : (
-                          <p className="text-[12px] text-gray-400 py-4 text-center">No traffic data yet</p>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Error Logs */}
+                    {supabaseSvc && <LiveLogsCard projectRef={supabaseSvc.resource_id} />}
                     <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
                       <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
                         <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Error Logs</p>
@@ -1733,121 +1624,315 @@ export default function ProjectPage() {
                     </div>
                   </div>
 
-                  {/* Row 3: Edge Functions + Storage side by side */}
+                  {/* Row 3: Analytics (tabbed) + Config */}
                   <div className="grid grid-cols-2 gap-3">
-                    {/* Edge Functions */}
-                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
+                    {/* Analytics tabbed card */}
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden flex flex-col">
                       <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
-                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Edge Functions</p>
-                        {supabaseFunctions.length > 0 && (
-                          <span className="text-[10px] text-gray-400">{supabaseFunctions.length} deployed</span>
-                        )}
+                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Analytics</p>
+                        <span className="text-[10px] text-gray-400">Last 24h</span>
                       </div>
-                      {supabaseFunctions.length === 0 ? (
-                        <div className="flex flex-col items-center py-8 gap-1.5">
-                          <svg className="w-6 h-6 text-gray-200" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
-                          <p className="text-[12px] text-gray-400">No functions deployed</p>
-                        </div>
-                      ) : (
-                        <div className="divide-y divide-gray-100">
-                          {supabaseFunctions.map((fn) => (
-                            <div key={fn.id} className="flex items-center gap-3 px-4 py-2.5">
-                              <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${fn.status === "ACTIVE" ? "bg-emerald-400" : fn.status === "INACTIVE" ? "bg-gray-300" : "bg-amber-400"}`} />
-                              <div className="flex-1 min-w-0">
-                                <div className="text-[12px] font-medium text-gray-800 truncate">{fn.name}</div>
-                                <div className="text-[10px] text-gray-400 font-mono truncate">{fn.slug}</div>
-                              </div>
-                              <div className="flex items-center gap-1.5 shrink-0">
-                                {!fn.verify_jwt && (
-                                  <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-600" title="JWT verification disabled">No JWT</span>
-                                )}
-                                <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full ${fn.status === "ACTIVE" ? "bg-emerald-50 text-emerald-600" : "bg-gray-100 text-gray-500"}`}>{fn.status}</span>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Storage Buckets */}
-                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
-                      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
-                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Storage</p>
-                        {supabaseStorage?.available && supabaseStorage.buckets.length > 0 && (
-                          <span className="text-[10px] text-gray-400">{supabaseStorage.buckets.length} bucket{supabaseStorage.buckets.length !== 1 ? "s" : ""}</span>
-                        )}
-                      </div>
-                      {!supabaseStorage ? (
-                        <div className="space-y-2 px-4 py-3 animate-pulse">{[0,1,2].map(i => <div key={i} className="h-10 bg-gray-50 rounded-lg" />)}</div>
-                      ) : !supabaseStorage.available ? (
-                        <div className="flex flex-col items-center py-8 gap-1.5">
-                          <p className="text-[12px] text-gray-400">Storage unavailable</p>
-                        </div>
-                      ) : supabaseStorage.buckets.length === 0 ? (
-                        <div className="flex flex-col items-center py-8 gap-1.5">
-                          <svg className="w-6 h-6 text-gray-200" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M5 8a7 7 0 0114 0v8a2 2 0 01-2 2H7a2 2 0 01-2-2V8z"/></svg>
-                          <p className="text-[12px] text-gray-400">No storage buckets</p>
-                        </div>
-                      ) : (
-                        <div className="divide-y divide-gray-100">
-                          {supabaseStorage.buckets.map((b) => (
-                            <div key={b.id} className="flex items-center gap-3 px-4 py-2.5">
-                              <svg className="w-4 h-4 text-gray-300 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M20 7H4a2 2 0 00-2 2v6a2 2 0 002 2h16a2 2 0 002-2V9a2 2 0 00-2-2z"/><path d="M16 3H8L4 7h16l-4-4z"/></svg>
-                              <div className="flex-1 min-w-0">
-                                <div className="text-[12px] font-medium text-gray-800 truncate">{b.name}</div>
-                                {b.file_size_limit && (
-                                  <div className="text-[10px] text-gray-400">limit {b.file_size_limit >= 1e6 ? `${(b.file_size_limit/1e6).toFixed(0)} MB` : `${b.file_size_limit} B`}</div>
-                                )}
-                              </div>
-                              <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${b.public ? "bg-amber-50 text-amber-600" : "bg-gray-100 text-gray-500"}`}>
-                                {b.public ? "Public" : "Private"}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Row 4: Actions full width */}
-                  <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
-                    <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
-                      <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Actions</p>
-                      {supabaseOverview && supabaseOverview.actions.length > 0 && (
-                        <span className="text-[10px] text-gray-400">{supabaseOverview.actions.length} total</span>
-                      )}
-                    </div>
-                    {!supabaseOverview ? (
-                      <p className="text-[12px] text-gray-400 text-center py-8">Loading…</p>
-                    ) : supabaseOverview.available.actions === false ? (
-                      <p className="text-[12px] text-gray-400 text-center py-8">Action history not available</p>
-                    ) : supabaseOverview.actions.length === 0 ? (
-                      <p className="text-[12px] text-gray-400 text-center py-8">No actions found</p>
-                    ) : (
-                      <div className="divide-y divide-gray-100">
-                        {supabaseOverview.actions.map((action) => (
-                          <div key={action.id} className="flex items-center gap-3 px-5 py-3">
-                            <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                              action.status === "COMPLETED" ? "bg-emerald-400" :
-                              action.status === "FAILED" ? "bg-red-400" :
-                              action.status === "IN_PROGRESS" ? "bg-amber-400 animate-pulse" :
-                              "bg-gray-300"
-                            }`} />
-                            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${
-                              action.status === "COMPLETED" ? "text-emerald-600 bg-emerald-50" :
-                              action.status === "FAILED" ? "text-red-500 bg-red-50" :
-                              action.status === "IN_PROGRESS" ? "text-amber-500 bg-amber-50" :
-                              "text-gray-500 bg-gray-100"
-                            }`}>{action.status}</span>
-                            {action.error_message && (
-                              <span className="text-[12px] text-gray-500 truncate flex-1">{action.error_message}</span>
-                            )}
-                            <span suppressHydrationWarning className="text-[11px] text-gray-400 shrink-0 ml-auto">{timeAgo(new Date(action.created_at).getTime())}</span>
-                          </div>
+                      {/* Tab bar */}
+                      <div className="flex border-b border-gray-100 bg-gray-50/40">
+                        {ANALYTICS_TABS.map((tab) => (
+                          <button
+                            key={tab.id}
+                            onClick={() => setSupabaseAnalyticsTab(tab.id)}
+                            className={`flex-1 py-2 text-[10px] font-semibold transition-colors ${supabaseAnalyticsTab === tab.id ? "text-brand-purple border-b-2 border-brand-purple bg-white" : "text-gray-400 hover:text-gray-600"}`}
+                          >
+                            {tab.label}
+                          </button>
                         ))}
                       </div>
-                    )}
+                      {/* Tab content */}
+                      <div className="flex-1 overflow-y-auto">
+                        {supabaseAnalyticsTab === "latency" && (
+                          <div className="px-5 py-4">
+                            {!supabaseAnalytics ? (
+                              <div className="h-16 bg-gray-50 rounded-lg animate-pulse" />
+                            ) : !supabaseAnalytics.available.latency || !supabaseAnalytics.latency ? (
+                              <p className="text-[12px] text-gray-400 text-center py-4">Not available</p>
+                            ) : (() => {
+                              const { p50, p95, p99, avg_ms, total, errors } = supabaseAnalytics.latency!;
+                              const errRate = total > 0 ? Math.round((errors / total) * 100) : 0;
+                              return (
+                                <div className="space-y-3">
+                                  <div className="grid grid-cols-3 gap-2">
+                                    {[
+                                      { label: "p50", value: p50, warn: 500 },
+                                      { label: "p95", value: p95, warn: 1000 },
+                                      { label: "p99", value: p99, warn: 2000 },
+                                    ].map(({ label, value, warn }) => (
+                                      <div key={label} className={`rounded-xl p-3 text-center ${value !== null && value > warn ? "bg-red-50 border border-red-100" : "bg-gray-50/80"}`}>
+                                        <div className={`text-[17px] font-bold leading-none ${value !== null && value > warn ? "text-red-500" : "text-gray-900"}`}>
+                                          {value !== null ? (value >= 1000 ? `${(value/1000).toFixed(1)}s` : `${Math.round(value)}ms`) : "—"}
+                                        </div>
+                                        <div className="text-[9px] uppercase tracking-wider text-gray-400 mt-1">{label}</div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                  <div className="flex items-center justify-between pt-1 border-t border-gray-100">
+                                    <span className="text-[11px] text-gray-500">
+                                      avg <span className="font-semibold text-gray-800">{avg_ms !== null ? (avg_ms >= 1000 ? `${(avg_ms/1000).toFixed(1)}s` : `${Math.round(avg_ms)}ms`) : "—"}</span>
+                                    </span>
+                                    <span className="text-[11px] text-gray-500">
+                                      {total.toLocaleString()} req
+                                      {errors > 0 && <span className="ml-2 text-red-500 font-semibold">{errRate}% err</span>}
+                                    </span>
+                                  </div>
+                                </div>
+                              );
+                            })()}
+                          </div>
+                        )}
+                        {supabaseAnalyticsTab === "funnel" && (
+                          <div className="divide-y divide-gray-100">
+                            {!supabaseAnalytics ? (
+                              <div className="px-5 py-4 space-y-2 animate-pulse">{[0,1,2].map(i => <div key={i} className="h-8 bg-gray-50 rounded" />)}</div>
+                            ) : !supabaseAnalytics.available.auth_funnel || supabaseAnalytics.auth_funnel.length === 0 ? (
+                              <p className="text-[12px] text-gray-400 text-center py-8">No auth activity</p>
+                            ) : (() => {
+                              const maxTotal = Math.max(...supabaseAnalytics.auth_funnel.map(r => r.total), 1);
+                              const EVENT_LABELS: Record<string, string> = { signup: "Sign Up", login: "Login", logout: "Logout", recovery: "Password Recovery", verify: "Email Verify" };
+                              return supabaseAnalytics.auth_funnel.map((row) => {
+                                const errRate = row.total > 0 ? Math.round((row.errors / row.total) * 100) : 0;
+                                return (
+                                  <div key={row.event} className="px-5 py-3">
+                                    <div className="flex items-center justify-between mb-1.5">
+                                      <span className="text-[12px] font-semibold text-gray-700">{EVENT_LABELS[row.event] ?? row.event}</span>
+                                      <div className="flex items-center gap-2">
+                                        <span className="text-[11px] font-semibold text-gray-800">{row.total.toLocaleString()}<span className="text-[9px] font-normal text-gray-400 ml-0.5">req</span></span>
+                                        {row.errors > 0 && <span className="text-[10px] font-semibold text-red-500 bg-red-50 border border-red-100 px-1.5 py-0.5 rounded-full">{errRate}% err</span>}
+                                      </div>
+                                    </div>
+                                    <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                                      <div className="h-full rounded-full bg-brand-purple/40" style={{ width: `${(row.total / maxTotal) * 100}%` }} />
+                                    </div>
+                                  </div>
+                                );
+                              });
+                            })()}
+                          </div>
+                        )}
+                        {supabaseAnalyticsTab === "queries" && (
+                          <>
+                            {!supabaseAnalytics ? (
+                              <div className="px-5 py-4 space-y-2 animate-pulse">{[0,1,2].map(i => <div key={i} className="h-10 bg-gray-50 rounded" />)}</div>
+                            ) : !supabaseAnalytics.available.slow_queries ? (
+                              <p className="text-[12px] text-gray-400 text-center py-8">Not available</p>
+                            ) : supabaseAnalytics.slow_queries.length === 0 ? (
+                              <div className="flex flex-col items-center py-8 gap-2">
+                                <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                                <p className="text-[12px] text-gray-400">No slow queries detected</p>
+                              </div>
+                            ) : (
+                              <div className="divide-y divide-gray-100">
+                                {supabaseAnalytics.slow_queries.map((q, i) => (
+                                  <div key={i} className="px-5 py-3">
+                                    <div className="flex items-center gap-3 mb-1">
+                                      {q.duration_ms !== null && (
+                                        <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full shrink-0 ${q.duration_ms > 1000 ? "bg-red-50 text-red-500 border border-red-100" : "bg-amber-50 text-amber-600 border border-amber-100"}`}>
+                                          {q.duration_ms >= 1000 ? `${(q.duration_ms/1000).toFixed(2)}s` : `${Math.round(q.duration_ms)}ms`}
+                                        </span>
+                                      )}
+                                      {q.user && <span className="text-[10px] text-gray-400 shrink-0">{q.user}</span>}
+                                      <span suppressHydrationWarning className="text-[10px] text-gray-400 ml-auto shrink-0">
+                                        {new Date(q.ts).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}
+                                      </span>
+                                    </div>
+                                    <p className="text-[11px] font-mono text-gray-600 truncate">{q.query}</p>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </>
+                        )}
+                        {supabaseAnalyticsTab === "actions" && (
+                          <>
+                            {!supabaseOverview ? (
+                              <p className="text-[12px] text-gray-400 text-center py-8">Loading…</p>
+                            ) : supabaseOverview.available.actions === false ? (
+                              <p className="text-[12px] text-gray-400 text-center py-8">Action history not available</p>
+                            ) : supabaseOverview.actions.length === 0 ? (
+                              <p className="text-[12px] text-gray-400 text-center py-8">No actions found</p>
+                            ) : (
+                              <div className="divide-y divide-gray-100">
+                                {supabaseOverview.actions.map((action) => (
+                                  <div key={action.id} className="flex items-center gap-3 px-5 py-3">
+                                    <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                                      action.status === "COMPLETED" ? "bg-emerald-400" :
+                                      action.status === "FAILED" ? "bg-red-400" :
+                                      action.status === "IN_PROGRESS" ? "bg-amber-400 animate-pulse" :
+                                      "bg-gray-300"
+                                    }`} />
+                                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${
+                                      action.status === "COMPLETED" ? "text-emerald-600 bg-emerald-50" :
+                                      action.status === "FAILED" ? "text-red-500 bg-red-50" :
+                                      action.status === "IN_PROGRESS" ? "text-amber-500 bg-amber-50" :
+                                      "text-gray-500 bg-gray-100"
+                                    }`}>{action.status}</span>
+                                    {action.error_message && (
+                                      <span className="text-[12px] text-gray-500 truncate flex-1">{action.error_message}</span>
+                                    )}
+                                    <span suppressHydrationWarning className="text-[11px] text-gray-400 shrink-0 ml-auto">{timeAgo(new Date(action.created_at).getTime())}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Config card: Project + Auth */}
+                    <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden flex flex-col">
+                      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60 flex items-center justify-between">
+                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Config</p>
+                        {supabaseConfig?.auth && (
+                          <div className="flex items-center gap-2">
+                            {supabaseConfig.auth.mfa_enabled && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-brand-purple/10 text-brand-purple">MFA</span>}
+                            {supabaseConfig.auth.anonymous_sign_ins && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-500">Anon</span>}
+                          </div>
+                        )}
+                      </div>
+                      {!supabaseConfig ? (
+                        <div className="space-y-2 px-5 py-3 animate-pulse">{[0,1,2,3,4].map(i => <div key={i} className="h-5 bg-gray-50 rounded" />)}</div>
+                      ) : (
+                        <div className="flex flex-1 divide-x divide-gray-100 overflow-hidden">
+                          {/* Project column */}
+                          <div className="flex-1 px-4 py-3 space-y-2.5 min-w-0">
+                            <p className="text-[9px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Project</p>
+                            {[
+                              { label: "Region", value: supabaseConfig.project?.region ?? null },
+                              { label: "Status", value: supabaseConfig.project?.status?.replace(/_/g, " ") ?? null },
+                              { label: "Created", value: supabaseConfig.project?.created_at ? new Date(supabaseConfig.project.created_at).toLocaleDateString() : null },
+                              { label: "DB Host", value: supabaseConfig.project?.db_host ?? null, mono: true },
+                            ].map(({ label, value, mono }) => (
+                              <div key={label} className="flex flex-col gap-0.5">
+                                <span className="text-[9px] text-gray-400 uppercase tracking-wider">{label}</span>
+                                <span className={`text-[11px] text-gray-700 truncate ${mono ? "font-mono" : "font-medium"}`}>{value ?? "—"}</span>
+                              </div>
+                            ))}
+                          </div>
+                          {/* Auth column */}
+                          <div className="flex-1 px-4 py-3 min-w-0">
+                            <p className="text-[9px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Auth</p>
+                            <div className="space-y-2.5">
+                              {supabaseConfig.auth?.site_url && (
+                                <div className="flex flex-col gap-0.5">
+                                  <span className="text-[9px] text-gray-400 uppercase tracking-wider">Site URL</span>
+                                  <span className="text-[11px] text-gray-600 font-mono truncate">{supabaseConfig.auth.site_url}</span>
+                                </div>
+                              )}
+                              {supabaseConfig.auth?.min_password_length != null && (
+                                <div className="flex flex-col gap-0.5">
+                                  <span className="text-[9px] text-gray-400 uppercase tracking-wider">Min Password</span>
+                                  <span className="text-[11px] text-gray-700 font-medium">{supabaseConfig.auth.min_password_length} chars</span>
+                                </div>
+                              )}
+                              <div>
+                                <p className="text-[9px] text-gray-400 uppercase tracking-wider mb-1.5">Providers</p>
+                                {(supabaseConfig.auth?.providers ?? []).length === 0 ? (
+                                  <p className="text-[11px] text-gray-400">None enabled</p>
+                                ) : (
+                                  <div className="flex flex-wrap gap-1">
+                                    {(supabaseConfig.auth?.providers ?? []).map((p) => (
+                                      <span key={p} className="flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 capitalize">
+                                        <span className="text-[9px]">{PROVIDER_ICONS[p] ?? "○"}</span>
+                                        {p}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
+
+                  {/* Row 4: Resources — Edge Functions + Storage */}
+                  <div className="bg-white/95 backdrop-blur-[10px] border border-white/60 rounded-card shadow-card overflow-hidden">
+                    <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/60">
+                      <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Resources</p>
+                    </div>
+                    <div className="grid grid-cols-2 divide-x divide-gray-100">
+                      {/* Edge Functions */}
+                      <div className="overflow-hidden">
+                        <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between">
+                          <p className="text-[10px] font-medium text-gray-500">Edge Functions</p>
+                          {supabaseFunctions.length > 0 && (
+                            <span className="text-[10px] text-gray-400">{supabaseFunctions.length} deployed</span>
+                          )}
+                        </div>
+                        {supabaseFunctions.length === 0 ? (
+                          <div className="flex flex-col items-center py-6 gap-1.5">
+                            <svg className="w-5 h-5 text-gray-200" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                            <p className="text-[11px] text-gray-400">No functions deployed</p>
+                          </div>
+                        ) : (
+                          <div className="divide-y divide-gray-100">
+                            {supabaseFunctions.map((fn) => (
+                              <div key={fn.id} className="flex items-center gap-3 px-4 py-2.5">
+                                <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${fn.status === "ACTIVE" ? "bg-emerald-400" : fn.status === "INACTIVE" ? "bg-gray-300" : "bg-amber-400"}`} />
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-[12px] font-medium text-gray-800 truncate">{fn.name}</div>
+                                  <div className="text-[10px] text-gray-400 font-mono truncate">{fn.slug}</div>
+                                </div>
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  {!fn.verify_jwt && (
+                                    <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-600" title="JWT verification disabled">No JWT</span>
+                                  )}
+                                  <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full ${fn.status === "ACTIVE" ? "bg-emerald-50 text-emerald-600" : "bg-gray-100 text-gray-500"}`}>{fn.status}</span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Storage Buckets */}
+                      <div className="overflow-hidden">
+                        <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between">
+                          <p className="text-[10px] font-medium text-gray-500">Storage</p>
+                          {supabaseStorage?.available && supabaseStorage.buckets.length > 0 && (
+                            <span className="text-[10px] text-gray-400">{supabaseStorage.buckets.length} bucket{supabaseStorage.buckets.length !== 1 ? "s" : ""}</span>
+                          )}
+                        </div>
+                        {!supabaseStorage ? (
+                          <div className="space-y-2 px-4 py-3 animate-pulse">{[0,1,2].map(i => <div key={i} className="h-10 bg-gray-50 rounded-lg" />)}</div>
+                        ) : !supabaseStorage.available ? (
+                          <div className="flex flex-col items-center py-6 gap-1.5">
+                            <p className="text-[11px] text-gray-400">Storage unavailable</p>
+                          </div>
+                        ) : supabaseStorage.buckets.length === 0 ? (
+                          <div className="flex flex-col items-center py-6 gap-1.5">
+                            <svg className="w-5 h-5 text-gray-200" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M5 8a7 7 0 0114 0v8a2 2 0 01-2 2H7a2 2 0 01-2-2V8z"/></svg>
+                            <p className="text-[11px] text-gray-400">No storage buckets</p>
+                          </div>
+                        ) : (
+                          <div className="divide-y divide-gray-100">
+                            {supabaseStorage.buckets.map((b) => (
+                              <div key={b.id} className="flex items-center gap-3 px-4 py-2.5">
+                                <svg className="w-4 h-4 text-gray-300 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M20 7H4a2 2 0 00-2 2v6a2 2 0 002 2h16a2 2 0 002-2V9a2 2 0 00-2-2z"/><path d="M16 3H8L4 7h16l-4-4z"/></svg>
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-[12px] font-medium text-gray-800 truncate">{b.name}</div>
+                                  {b.file_size_limit && (
+                                    <div className="text-[10px] text-gray-400">limit {b.file_size_limit >= 1e6 ? `${(b.file_size_limit/1e6).toFixed(0)} MB` : `${b.file_size_limit} B`}</div>
+                                  )}
+                                </div>
+                                <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${b.public ? "bg-amber-50 text-amber-600" : "bg-gray-100 text-gray-500"}`}>
+                                  {b.public ? "Public" : "Private"}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
                 </div>
               );
             })()}

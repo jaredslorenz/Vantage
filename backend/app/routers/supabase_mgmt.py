@@ -1,15 +1,27 @@
 import asyncio
+import logging
 import re
 from datetime import datetime, timezone, timedelta
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+
+logger = logging.getLogger(__name__)
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from app.core.encryption import encrypt_token, decrypt_token
+from app.core.limiter import limiter
 from app.core.security import get_user_id
 from app.core.supabase import supabase
 from app.core import token_cache
 
 SUPABASE_API = "https://api.supabase.com/v1"
+
+# Simple in-process cache for live log responses — keyed by (ref, source), TTL 60s
+_live_log_cache: dict[str, tuple[float, list]] = {}
+_LIVE_LOG_TTL = 60.0
+
+# Cache for daily traffic — TTL 5 min (data changes slowly)
+_daily_traffic_cache: dict[str, tuple[float, dict]] = {}
+_DAILY_TRAFFIC_TTL = 300.0
 
 # Allowlist for log sources — never interpolate client input into SQL
 _TRAFFIC_SQL = (
@@ -34,7 +46,7 @@ _TRAFFIC_SQL = (
     " limit 10"
 )
 
-_TRAFFIC_DAILY_SQL = (
+_TRAFFIC_HOURLY_SQL = (
     "select"
     "  case"
     "    when r.path like '/auth/%' then 'auth'"
@@ -44,17 +56,47 @@ _TRAFFIC_DAILY_SQL = (
     "    when r.path like '/realtime/%' then 'realtime'"
     "    else 'other'"
     "  end as service,"
-    "  format_timestamp('%Y-%m-%d', timestamp) as day,"
+    "  substr(cast(timestamp as string), 1, 13) as hour,"
     "  count(*) as total,"
     "  countif(resp.status_code >= 400) as errors"
     " from edge_logs"
     " cross join unnest(metadata) as m"
     " cross join unnest(m.request) as r"
     " cross join unnest(m.response) as resp"
-    " where timestamp > timestamp_sub(current_timestamp(), interval 7 day)"
+    " where timestamp > timestamp_sub(current_timestamp(), interval 24 hour)"
     " group by 1, 2"
-    " order by service, day"
+    " order by service, hour"
 )
+
+_LIVE_LOG_SOURCES = {
+    "postgres": (
+        "select datetime(timestamp) as ts, event_message,"
+        " m.parsed.error_severity, m.parsed.sql_state_code, m.parsed.user_name"
+        " from postgres_logs"
+        " cross join unnest(metadata) as m"
+        " order by timestamp desc limit 25"
+    ),
+    "edge": (
+        "select datetime(timestamp) as ts, r.method, r.path, resp.status_code"
+        " from edge_logs"
+        " cross join unnest(metadata) as m"
+        " cross join unnest(m.request) as r"
+        " cross join unnest(m.response) as resp"
+        " order by timestamp desc limit 25"
+    ),
+    "auth": (
+        "select datetime(timestamp) as ts, event_message, m.level, m.msg, m.path, m.status"
+        " from auth_logs"
+        " cross join unnest(metadata) as m"
+        " order by timestamp desc limit 25"
+    ),
+    "functions": (
+        "select datetime(timestamp) as ts, event_message, m.level, m.function_id"
+        " from function_logs"
+        " cross join unnest(metadata) as m"
+        " order by timestamp desc limit 25"
+    ),
+}
 
 _LOG_SOURCES = {
     "postgres": (
@@ -93,6 +135,50 @@ _LOG_SOURCES = {
         " order by timestamp desc limit 50"
     ),
 }
+
+_SLOW_QUERIES_SQL = (
+    "select datetime(timestamp) as ts, event_message, m.parsed.user_name as user_name"
+    " from postgres_logs"
+    " cross join unnest(metadata) as m"
+    " where event_message like 'duration:%'"
+    " and timestamp > timestamp_sub(current_timestamp(), interval 24 hour)"
+    " order by timestamp desc limit 25"
+)
+
+_API_LATENCY_SQL = (
+    "select"
+    "  approx_quantiles(resp.origin_time, 100)[offset(50)] as p50,"
+    "  approx_quantiles(resp.origin_time, 100)[offset(95)] as p95,"
+    "  approx_quantiles(resp.origin_time, 100)[offset(99)] as p99,"
+    "  avg(resp.origin_time) as avg_ms,"
+    "  count(*) as total,"
+    "  countif(resp.status_code >= 400) as errors"
+    " from edge_logs"
+    " cross join unnest(metadata) as m"
+    " cross join unnest(m.request) as r"
+    " cross join unnest(m.response) as resp"
+    " where timestamp > timestamp_sub(current_timestamp(), interval 24 hour)"
+)
+
+_AUTH_FUNNEL_SQL = (
+    "select"
+    "  case"
+    "    when m.path like '%/signup%' then 'signup'"
+    "    when m.path like '%/token%' then 'login'"
+    "    when m.path like '%/recover%' then 'recovery'"
+    "    when m.path like '%/logout%' then 'logout'"
+    "    when m.path like '%/verify%' then 'verify'"
+    "    else 'other'"
+    "  end as event,"
+    "  count(*) as total,"
+    "  countif(m.status >= 400) as errors"
+    " from auth_logs"
+    " cross join unnest(metadata) as m"
+    " where timestamp > timestamp_sub(current_timestamp(), interval 24 hour)"
+    " group by 1"
+    " having event != 'other'"
+    " order by total desc"
+)
 
 # Prometheus metric names we care about — ignore everything else
 _METRIC_ALLOWLIST = {
@@ -364,18 +450,26 @@ async def get_project_traffic_daily(ref: str, user_id: str = Depends(get_user_id
     _assert_owns_supabase_project(user_id, ref)
     token = _get_token(user_id)
 
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if ref in _daily_traffic_cache:
+        cached_at, cached_data = _daily_traffic_cache[ref]
+        if now_ts - cached_at < _DAILY_TRAFFIC_TTL:
+            return cached_data
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(
             f"{SUPABASE_API}/projects/{ref}/analytics/endpoints/logs.all",
             headers={"Authorization": f"Bearer {token}"},
-            params={"sql": _TRAFFIC_DAILY_SQL},
+            params={"sql": _TRAFFIC_HOURLY_SQL},
         )
 
     if resp.status_code != 200:
+        logger.warning("traffic/daily %s → HTTP %d: %s", ref, resp.status_code, resp.text[:200])
         return {"available": False, "services": {}}
 
     raw = resp.json()
     rows = raw.get("result", raw.get("data", []))
+    logger.info("traffic/daily %s → %d rows", ref, len(rows) if isinstance(rows, list) else 0)
 
     # Build { service: [{ day, total, errors }, ...] }
     services: dict[str, list[dict]] = {}
@@ -384,12 +478,93 @@ async def get_project_traffic_daily(ref: str, user_id: str = Depends(get_user_id
         if svc == "other":
             continue
         services.setdefault(svc, []).append({
-            "day": row.get("day", ""),
+            "day": row.get("hour", row.get("day", "")),
             "total": int(row.get("total", 0)),
             "errors": int(row.get("errors", 0)),
         })
 
-    return {"available": True, "services": services}
+    result = {"available": True, "services": services}
+    _daily_traffic_cache[ref] = (now_ts, result)
+    return result
+
+
+@router.get("/projects/{ref}/analytics")
+@limiter.limit("10/minute")
+async def get_project_analytics(request: Request, ref: str, user_id: str = Depends(get_user_id)):
+    """Return slow queries, API latency percentiles, and auth funnel counts."""
+    _validate_ref(ref)
+    _assert_owns_supabase_project(user_id, ref)
+    token = _get_token(user_id)
+    headers = {"Authorization": f"Bearer {token}"}
+    logs_url = f"{SUPABASE_API}/projects/{ref}/analytics/endpoints/logs.all"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        slow_resp, latency_resp, auth_resp = await asyncio.gather(
+            client.get(logs_url, headers=headers, params={"sql": _SLOW_QUERIES_SQL}),
+            client.get(logs_url, headers=headers, params={"sql": _API_LATENCY_SQL}),
+            client.get(logs_url, headers=headers, params={"sql": _AUTH_FUNNEL_SQL}),
+            return_exceptions=True,
+        )
+
+    # Slow queries
+    slow_queries = []
+    if not isinstance(slow_resp, Exception) and slow_resp.status_code == 200:
+        rows = slow_resp.json().get("result", slow_resp.json().get("data", []))
+        for row in (rows if isinstance(rows, list) else []):
+            msg = row.get("event_message", "")
+            # Parse "duration: 123.456 ms  statement: SELECT ..."
+            duration_ms = None
+            query_text = None
+            if msg.startswith("duration:"):
+                parts = msg.split("  statement: ", 1)
+                try:
+                    duration_ms = float(parts[0].replace("duration:", "").replace("ms", "").strip())
+                except ValueError:
+                    pass
+                query_text = parts[1].strip() if len(parts) > 1 else msg
+            slow_queries.append({
+                "ts": row.get("ts", ""),
+                "duration_ms": duration_ms,
+                "query": query_text or msg,
+                "user": row.get("user_name"),
+            })
+
+    # API latency
+    latency = None
+    if not isinstance(latency_resp, Exception) and latency_resp.status_code == 200:
+        rows = latency_resp.json().get("result", latency_resp.json().get("data", []))
+        if rows and isinstance(rows, list) and len(rows) > 0:
+            r = rows[0]
+            latency = {
+                "p50": round(float(r["p50"]), 1) if r.get("p50") is not None else None,
+                "p95": round(float(r["p95"]), 1) if r.get("p95") is not None else None,
+                "p99": round(float(r["p99"]), 1) if r.get("p99") is not None else None,
+                "avg_ms": round(float(r["avg_ms"]), 1) if r.get("avg_ms") is not None else None,
+                "total": int(r.get("total", 0)),
+                "errors": int(r.get("errors", 0)),
+            }
+
+    # Auth funnel
+    auth_funnel = []
+    if not isinstance(auth_resp, Exception) and auth_resp.status_code == 200:
+        rows = auth_resp.json().get("result", auth_resp.json().get("data", []))
+        for row in (rows if isinstance(rows, list) else []):
+            auth_funnel.append({
+                "event": row.get("event", ""),
+                "total": int(row.get("total", 0)),
+                "errors": int(row.get("errors", 0)),
+            })
+
+    return {
+        "slow_queries": slow_queries,
+        "latency": latency,
+        "auth_funnel": auth_funnel,
+        "available": {
+            "slow_queries": not isinstance(slow_resp, Exception) and slow_resp.status_code == 200,
+            "latency": not isinstance(latency_resp, Exception) and latency_resp.status_code == 200,
+            "auth_funnel": not isinstance(auth_resp, Exception) and auth_resp.status_code == 200,
+        },
+    }
 
 
 @router.get("/projects/{ref}/config")
@@ -537,7 +712,8 @@ async def get_project_overview(ref: str, user_id: str = Depends(get_user_id)):
 
 
 @router.get("/projects/{ref}/metrics")
-async def get_project_metrics(ref: str, user_id: str = Depends(get_user_id)):
+@limiter.limit("10/minute")
+async def get_project_metrics(request: Request, ref: str, user_id: str = Depends(get_user_id)):
     """Scrape the Prometheus metrics endpoint and return key health series."""
     _validate_ref(ref)
     _assert_owns_supabase_project(user_id, ref)
@@ -698,6 +874,45 @@ async def get_project_logs(ref: str, source: str, user_id: str = Depends(get_use
     raw = resp.json()
     rows = raw.get("result", raw.get("data", []))
     return {"source": source, "rows": rows if isinstance(rows, list) else []}
+
+
+@router.get("/projects/{ref}/logs/{source}/live")
+@limiter.limit("20/minute")
+async def get_project_logs_live(request: Request, ref: str, source: str, user_id: str = Depends(get_user_id)):
+    """Query a Supabase log source for all entries in the last 5 minutes."""
+    _validate_ref(ref)
+    if source not in _LIVE_LOG_SOURCES:
+        raise HTTPException(status_code=400, detail=f"Invalid log source. Must be one of: {', '.join(_LIVE_LOG_SOURCES)}")
+    _assert_owns_supabase_project(user_id, ref)
+    token = _get_token(user_id)
+
+    cache_key = f"{ref}:{source}"
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if cache_key in _live_log_cache:
+        cached_at, cached_rows = _live_log_cache[cache_key]
+        if now_ts - cached_at < _LIVE_LOG_TTL:
+            return {"source": source, "rows": cached_rows}
+
+    sql = _LIVE_LOG_SOURCES[source]
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_API}/projects/{ref}/analytics/endpoints/logs.all",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"sql": sql},
+        )
+
+    if resp.status_code == 429:
+        cached_rows = _live_log_cache.get(cache_key, (0, []))[1]
+        return {"source": source, "rows": cached_rows, "rate_limited": True}
+    if resp.status_code != 200:
+        return {"source": source, "rows": []}
+
+    raw = resp.json()
+    rows = raw.get("result", raw.get("data", []))
+    rows = rows if isinstance(rows, list) else []
+    _live_log_cache[cache_key] = (now_ts, rows)
+    return {"source": source, "rows": rows}
 
 
 @router.get("/projects/{ref}/storage")

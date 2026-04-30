@@ -713,6 +713,8 @@ async def poll_render_metrics() -> None:
                     cpu_limit = cpu_lim_vals[0] if cpu_lim_vals else _CPU_LIMIT_FALLBACK
                     mem_limit = mem_lim_vals[0] if mem_lim_vals else _MEM_LIMIT_FALLBACK
 
+                    to_clear: list[str] = []
+
                     if cpu_avg is not None:
                         pct = cpu_avg / cpu_limit
                         if pct > 0.85:
@@ -734,6 +736,8 @@ async def poll_render_metrics() -> None:
                                 },
                                 "occurred_at": end_time,
                             })
+                        else:
+                            to_clear.append(f"metric-cpu-{svc_id}")
 
                     if mem_avg is not None:
                         pct = mem_avg / mem_limit
@@ -759,6 +763,18 @@ async def poll_render_metrics() -> None:
                                 },
                                 "occurred_at": end_time,
                             })
+                        else:
+                            to_clear.append(f"metric-mem-{svc_id}")
+
+                    for external_id in to_clear:
+                        try:
+                            supabase.table("events") \
+                                .delete() \
+                                .eq("user_id", user_id) \
+                                .eq("external_id", external_id) \
+                                .execute()
+                        except Exception as exc:
+                            logger.error("Failed to clear metric alert %s: %s", external_id, exc)
 
                 _upsert_events(rows)
 
@@ -1075,8 +1091,8 @@ async def check_endpoints() -> None:
 # ── Uptime cleanup ─────────────────────────────────────────────────────────
 
 def cleanup_uptime_checks() -> None:
-    """Delete uptime_checks rows older than 7 days."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    """Delete uptime_checks rows older than 24 hours."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     try:
         supabase.table("uptime_checks").delete().lt("checked_at", cutoff).execute()
     except Exception as exc:
